@@ -290,6 +290,13 @@ func (s *Server) handleConn(c *Conn) error {
 			return c.readError(err)
 		}
 
+		// Buffered/pipelined input need not touch the socket, so a read
+		// deadline alone does not enforce the session's progress budget.
+		if deadline, _ := c.getSessionDeadline(); !deadline.IsZero() && !time.Now().Before(deadline) {
+			c.writeResponse(421, EnhancedCode{4, 4, 2}, "Session timeout, closing connection")
+			return nil
+		}
+
 		cmd, arg, err := parseCmd(line)
 		if err != nil {
 			c.protocolError(501, EnhancedCode{5, 5, 2}, "Bad command")
