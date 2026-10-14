@@ -942,14 +942,14 @@ func TestServer_authParam(t *testing.T) {
 	defer c.Close()
 
 	// Invalid HEXCHAR — parameter syntax errors get 501 (RFC 5321 4.1.1.11)
-	io.WriteString(c, "MAIL FROM: root@nsa.gov AUTH=<hey+A>\r\n")
+	io.WriteString(c, "MAIL FROM: <root@nsa.gov> AUTH=<hey+A>\r\n")
 	scanner.Scan()
 	if !strings.HasPrefix(scanner.Text(), "501 ") {
 		t.Fatal("Invalid MAIL response:", scanner.Text())
 	}
 
 	// Invalid HEXCHAR
-	io.WriteString(c, "MAIL FROM: root@nsa.gov AUTH=<he+YYa>\r\n")
+	io.WriteString(c, "MAIL FROM: <root@nsa.gov> AUTH=<he+YYa>\r\n")
 	scanner.Scan()
 	if !strings.HasPrefix(scanner.Text(), "501 ") {
 		t.Fatal("Invalid MAIL response:", scanner.Text())
@@ -960,7 +960,7 @@ func TestServer_authParam(t *testing.T) {
 	// >extension MUST support the AUTH parameter to the MAIL FROM
 	// >command even when the client has not authenticated itself to the
 	// >server.
-	io.WriteString(c, "MAIL FROM: root@nsa.gov AUTH=hey+3Da@example.com\r\n")
+	io.WriteString(c, "MAIL FROM: <root@nsa.gov> AUTH=hey+3Da@example.com\r\n")
 	scanner.Scan()
 	if !strings.HasPrefix(scanner.Text(), "250 ") {
 		t.Fatal("Invalid MAIL response:", scanner.Text())
@@ -2015,5 +2015,22 @@ func TestServer_reEHLO(t *testing.T) {
 	// Verify that Logout() was called on the third session when connection closed
 	if count := thirdSession.getLogoutCount(); count != 1 {
 		t.Fatal("Expected Logout() to be called once on third session when connection closed, got:", count)
+	}
+}
+
+func TestServerRejectsParametersAfterUnbracketedPaths(t *testing.T) {
+	_, server, conn, scanner, _ := testServerEhlo(t)
+	defer server.Close()
+	defer conn.Close()
+	for _, step := range []struct{ command, code string }{
+		{"MAIL FROM:sender@example.com SIZE=100", "501 "},
+		{"MAIL FROM:<sender@example.com> SIZE=100", "250 "},
+		{"RCPT TO:recipient@example.com NOTIFY=SUCCESS", "501 "},
+		{"RCPT TO:<recipient@example.com>", "250 "},
+	} {
+		io.WriteString(conn, step.command+"\r\n")
+		if !scanner.Scan() || !strings.HasPrefix(scanner.Text(), step.code) {
+			t.Fatalf("%s: got %s, want %s", step.command, scanner.Text(), step.code)
+		}
 	}
 }

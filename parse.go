@@ -182,6 +182,10 @@ func (p *parser) parsePath() (string, error) {
 		if err := p.expectByte('>'); err != nil {
 			return "", err
 		}
+	} else if strings.TrimSpace(p.s) != "" {
+		// Preserve legacy bare mailbox compatibility only without parameters.
+		// ESMTP parameters require the path's explicit closing delimiter.
+		return "", fmt.Errorf("path with parameters must be enclosed in angle brackets")
 	}
 	return mbox, nil
 }
