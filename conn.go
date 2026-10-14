@@ -30,10 +30,11 @@ const errThreshold = 3
 const maxAuthFailures = 3
 
 type Conn struct {
-	conn   net.Conn
-	text   *textproto.Conn
-	server *Server
-	helo   string
+	conn     net.Conn
+	text     *textproto.Conn
+	server   *Server
+	helo     string
+	greeting string // guarded by locker
 
 	// Number of errors witnessed on this connection
 	errCount int
@@ -314,6 +315,21 @@ func (c *Conn) TLSConnectionState() (state tls.ConnectionState, ok bool) {
 	return tc.ConnectionState(), true
 }
 
+// Greeting returns the current greeting command: HELO, EHLO, or LHLO.
+// It is available inside Backend.NewSession and is empty before a greeting,
+// after STARTTLS, or if session creation failed.
+func (c *Conn) Greeting() string {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	return c.greeting
+}
+
+func (c *Conn) setGreeting(command string) {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	c.greeting = command
+}
+
 func (c *Conn) Hostname() string {
 	return c.helo
 }
@@ -389,6 +405,14 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	// c.helo is populated before NewSession so
 	// NewSession can access it via Conn.Hostname.
 	c.helo = domain
+	greeting := "HELO"
+	if enhanced {
+		greeting = "EHLO"
+		if c.server.LMTP {
+			greeting = "LHLO"
+		}
+	}
+	c.setGreeting(greeting)
 
 	// RFC 5321: "An EHLO command MAY be issued by a client later in the session"
 	// Access the session through the locked accessors: Conn.Close (via
@@ -410,6 +434,7 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	sess, err := c.server.Backend.NewSession(c)
 	if err != nil {
 		c.helo = ""
+		c.setGreeting("")
 		c.writeError(451, EnhancedCode{4, 0, 0}, err)
 		return
 	}
@@ -1241,6 +1266,7 @@ func (c *Conn) handleStartTLS() {
 		c.setSession(nil)
 	}
 	c.helo = ""
+	c.setGreeting("")
 	c.didAuth = false
 	// RFC 3207 section 4.2: the server MUST discard any knowledge obtained from
 	// the client which was not obtained from the TLS negotiation itself.
@@ -1858,6 +1884,7 @@ func (c *Conn) handleXCLIENT(arg string) {
 		c.setSession(nil)
 	}
 	c.helo = ""
+	c.setGreeting("")
 	c.didAuth = false
 	c.reset()
 
