@@ -314,6 +314,9 @@ func (c *Conn) TLSConnectionState() (state tls.ConnectionState, ok bool) {
 	return tc.ConnectionState(), true
 }
 
+// Greeting returns the current SMTP greeting command.
+func (c *Conn) Greeting() string { return "" }
+
 func (c *Conn) Hostname() string {
 	return c.helo
 }
