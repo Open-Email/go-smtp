@@ -88,3 +88,23 @@ func TestSessionDeadlineSurvivesSTARTTLSBeforeNewEHLO(t *testing.T) {
 		t.Fatalf("extra reply after timeout: %q", scanner.Text())
 	}
 }
+
+func TestSessionDeadlineCapsIdleRead(t *testing.T) {
+	_, server, conn, scanner := testServer(t, func(s *smtp.Server) {
+		s.ReadTimeout = time.Minute
+		s.Backend = smtp.BackendFunc(func(c *smtp.Conn) (smtp.Session, error) {
+			c.SetSessionDeadline(time.Now().Add(100 * time.Millisecond))
+			return ctxSession{}, nil
+		})
+	})
+	defer server.Close()
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	readGreetingReply(t, scanner, "220")
+	io.WriteString(conn, "EHLO client.example.org\r\n")
+	readGreetingReply(t, scanner, "250")
+	readGreetingReply(t, scanner, "421")
+	if scanner.Scan() {
+		t.Fatalf("extra reply after timeout: %q", scanner.Text())
+	}
+}
