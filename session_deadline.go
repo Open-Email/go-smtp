@@ -13,11 +13,12 @@ import "time"
 func (c *Conn) SetSessionDeadline(deadline time.Time) {
 	c.locker.Lock()
 	c.sessionDeadline = deadline
+	c.sessionDeadlineSet = true
 	c.locker.Unlock()
 }
 
-func (c *Conn) getSessionDeadline() time.Time {
+func (c *Conn) getSessionDeadline() (time.Time, bool) {
 	c.locker.Lock()
 	defer c.locker.Unlock()
-	return c.sessionDeadline
+	return c.sessionDeadline, c.sessionDeadlineSet
 }

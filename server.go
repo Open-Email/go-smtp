@@ -292,7 +292,7 @@ func (s *Server) handleConn(c *Conn) error {
 
 		// Buffered/pipelined input need not touch the socket, so a read
 		// deadline alone does not enforce the session's progress budget.
-		if deadline := c.getSessionDeadline(); !deadline.IsZero() && !time.Now().Before(deadline) {
+		if deadline, _ := c.getSessionDeadline(); !deadline.IsZero() && !time.Now().Before(deadline) {
 			c.writeResponse(421, EnhancedCode{4, 4, 2}, "Session timeout, closing connection")
 			return nil
 		}

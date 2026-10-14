@@ -30,12 +30,13 @@ const errThreshold = 3
 const maxAuthFailures = 3
 
 type Conn struct {
-	conn            net.Conn
-	text            *textproto.Conn
-	server          *Server
-	helo            string
-	greeting        string    // guarded by locker
-	sessionDeadline time.Time // guarded by locker; persists across greeting/TLS resets
+	conn               net.Conn
+	text               *textproto.Conn
+	server             *Server
+	helo               string
+	greeting           string    // guarded by locker
+	sessionDeadline    time.Time // guarded by locker; persists across greeting/TLS resets
+	sessionDeadlineSet bool      // also remember an explicit disable, to clear old read deadlines
 
 	// Number of errors witnessed on this connection
 	errCount int
@@ -1684,14 +1685,14 @@ func (c *Conn) writeError(code int, enhCode EnhancedCode, err error) {
 // (excluding CRLF). Bytes buffered behind the line — such as a pipelined BDAT
 // chunk following its command — do not count toward the limit.
 func (c *Conn) readLine() (string, error) {
-	deadline := c.getSessionDeadline()
+	deadline, configured := c.getSessionDeadline()
 	if c.server.ReadTimeout != 0 {
 		idleDeadline := time.Now().Add(c.server.ReadTimeout)
 		if deadline.IsZero() || idleDeadline.Before(deadline) {
 			deadline = idleDeadline
 		}
 	}
-	if !deadline.IsZero() {
+	if configured || !deadline.IsZero() {
 		if err := c.conn.SetReadDeadline(deadline); err != nil {
 			return "", err
 		}

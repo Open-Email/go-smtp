@@ -108,3 +108,28 @@ func TestSessionDeadlineCapsIdleRead(t *testing.T) {
 		t.Fatalf("extra reply after timeout: %q", scanner.Text())
 	}
 }
+
+func TestSessionDeadlineDisableClearsNextReadDeadline(t *testing.T) {
+	connections := make(chan *smtp.Conn, 1)
+	_, server, conn, scanner := testServer(t, func(s *smtp.Server) {
+		s.ReadTimeout = 0
+		s.Backend = smtp.BackendFunc(func(c *smtp.Conn) (smtp.Session, error) {
+			c.SetSessionDeadline(time.Now().Add(200 * time.Millisecond))
+			connections <- c
+			return ctxSession{}, nil
+		})
+	})
+	defer server.Close()
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	readGreetingReply(t, scanner, "220")
+	io.WriteString(conn, "EHLO client.example.org\r\n")
+	readGreetingReply(t, scanner, "250")
+	c := <-connections
+	c.SetSessionDeadline(time.Time{})
+	io.WriteString(conn, "NOOP\r\n")
+	readGreetingReply(t, scanner, "250")
+	time.Sleep(250 * time.Millisecond)
+	io.WriteString(conn, "NOOP\r\n")
+	readGreetingReply(t, scanner, "250")
+}
