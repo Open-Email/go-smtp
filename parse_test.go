@@ -12,7 +12,6 @@ func TestParser(t *testing.T) {
 		{"<root@nsa.gov>", "root@nsa.gov", ""},
 		{"root@nsa.gov", "root@nsa.gov", ""},
 		{"<root@nsa.gov> AUTH=asdf@example.org", "root@nsa.gov", " AUTH=asdf@example.org"},
-		{"root@nsa.gov AUTH=asdf@example.org", "root@nsa.gov", " AUTH=asdf@example.org"},
 		{`<"u..ser"@example.org>`, "u..ser@example.org", ""},
 		{`<"user."@example.org>`, "user.@example.org", ""},
 	}
@@ -223,6 +222,23 @@ func TestParseArgs(t *testing.T) {
 		for k, v := range tc.want {
 			if got[k] != v {
 				t.Errorf("parseArgs(%q)[%q] = %q, want %q", tc.raw, k, got[k], v)
+			}
+		}
+	}
+}
+
+func TestESMTPParametersRequireBracketedPath(t *testing.T) {
+	for _, raw := range []string{"user@example.com SIZE=100", "user@example.com SMTPUTF8", "user@example.com NOTIFY=SUCCESS", "user@example.com\tSMTPUTF8"} {
+		for _, forward := range []bool{false, true} {
+			p := parser{raw}
+			var err error
+			if forward {
+				_, err = p.parseForwardPath()
+			} else {
+				_, err = p.parseReversePath()
+			}
+			if err == nil {
+				t.Errorf("unbracketed path with parameters accepted: %q (forward=%v)", raw, forward)
 			}
 		}
 	}
