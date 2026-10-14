@@ -890,9 +890,9 @@ func (c *Conn) handleRcpt(arg string) {
 	}
 
 	p := parser{s: strings.TrimSpace(arg)}
-	recipient, err := p.parsePath()
+	recipient, err := p.parseForwardPath()
 	if err != nil {
-		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Was expecting RCPT arg syntax of TO:<address>")
+		c.writeResponse(501, EnhancedCode{5, 1, 3}, "Was expecting RCPT arg syntax of TO:<address>")
 		return
 	}
 
@@ -1048,15 +1048,23 @@ func (c *Conn) handleAuth(arg string) {
 		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Already authenticated")
 		return
 	}
+	if c.fromReceived {
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Error: AUTH not permitted during mail transaction")
+		return
+	}
 
 	parts := strings.Fields(arg)
 	if len(parts) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 4}, "Missing parameter")
+		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Missing parameter")
+		return
+	}
+	if len(parts) > 2 {
+		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Syntax error in parameters or arguments")
 		return
 	}
 
 	if !c.authAllowed() {
-		c.writeResponse(523, EnhancedCode{5, 7, 10}, "TLS is required")
+		c.writeResponse(538, EnhancedCode{5, 7, 11}, "Encryption required for requested authentication mechanism")
 		return
 	}
 
@@ -1068,7 +1076,7 @@ func (c *Conn) handleAuth(arg string) {
 		var err error
 		ir, err = decodeSASLResponse(parts[1])
 		if err != nil {
-			c.authFailed(454, EnhancedCode{4, 7, 0}, errors.New("Invalid base64 data"))
+			c.authFailed(501, EnhancedCode{5, 5, 2}, errors.New("Invalid base64 data"))
 			return
 		}
 	}
@@ -1117,7 +1125,7 @@ func (c *Conn) handleAuth(arg string) {
 
 		response, err = decodeSASLResponse(encoded)
 		if err != nil {
-			c.authFailed(454, EnhancedCode{4, 7, 0}, errors.New("Invalid base64 data"))
+			c.authFailed(501, EnhancedCode{5, 5, 2}, errors.New("Invalid base64 data"))
 			return
 		}
 	}

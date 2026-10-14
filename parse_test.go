@@ -13,6 +13,8 @@ func TestParser(t *testing.T) {
 		{"root@nsa.gov", "root@nsa.gov", ""},
 		{"<root@nsa.gov> AUTH=asdf@example.org", "root@nsa.gov", " AUTH=asdf@example.org"},
 		{"root@nsa.gov AUTH=asdf@example.org", "root@nsa.gov", " AUTH=asdf@example.org"},
+		{`<"u..ser"@example.org>`, "u..ser@example.org", ""},
+		{`<"user."@example.org>`, "user.@example.org", ""},
 	}
 	for _, tc := range validReversePaths {
 		p := parser{tc.raw}
@@ -34,6 +36,21 @@ func TestParser(t *testing.T) {
 		" BODY=8BITMIME SIZE=12345",
 		"a:b:c@example.org",
 		"<root@nsa.gov",
+		"<Postmaster>",
+		"<postmaster>",
+		`<"postmaster">`,
+		"postmaster",
+		"<.user@example.org>",
+		"<user.@example.org>",
+		"<u..ser@example.org>",
+		"<a\x01b@example.org>",
+		"<a\x00b@example.org>",
+		"<a\x7fb@example.org>",
+		"<\"a\x01b\"@example.org>",
+		"<\"a\x00b\"@example.org>",
+		"<\"a\x7fb\"@example.org>",
+		"<\"a\\\x01b\"@example.org>",
+		"<\"a\\\x00b\"@example.org>",
 	}
 	for _, tc := range invalidReversePaths {
 		p := parser{tc}

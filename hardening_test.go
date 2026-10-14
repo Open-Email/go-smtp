@@ -372,3 +372,179 @@ func TestServer_ConnContextCancelledOnShutdown(t *testing.T) {
 		t.Fatal("Shutdown did not return after connections closed")
 	}
 }
+
+func TestServer_AuthRejectedDuringMailTransaction(t *testing.T) {
+	_, s, c, scanner, _ := testServerEhlo(t)
+	defer s.Close()
+	defer c.Close()
+
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response:", scanner.Text())
+	}
+
+	// RFC 4954 §4: AUTH is not permitted during a mail transaction (MUST reply 503).
+	creds := base64.StdEncoding.EncodeToString([]byte("\x00username\x00password"))
+	io.WriteString(c, "AUTH PLAIN "+creds+"\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "503 5.5.1 ") {
+		t.Fatalf("Expected 503 5.5.1 for AUTH during mail transaction, got: %q", scanner.Text())
+	}
+}
+
+func TestServer_AuthInvalidBase64Returns501(t *testing.T) {
+	_, s, c, scanner, _ := testServerEhlo(t)
+	defer s.Close()
+	defer c.Close()
+
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// RFC 4954 §4 / RFC 5321 §4.2.4: AUTH with no mechanism argument MUST be rejected with 501 5.5.4.
+	io.WriteString(c, "AUTH\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "501 5.5.4 ") {
+		t.Fatalf("Expected 501 5.5.4 for bare AUTH without mechanism, got: %q", scanner.Text())
+	}
+
+	// RFC 4954 §4: invalid base64 in initial response MUST be rejected with 501 5.5.2.
+	io.WriteString(c, "AUTH PLAIN !!!not-base64!!!\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "501 5.5.2 ") {
+		t.Fatalf("Expected 501 5.5.2 for invalid initial base64, got: %q", scanner.Text())
+	}
+
+	// Invalid base64 in challenge response MUST also be rejected with 501 5.5.2.
+	io.WriteString(c, "AUTH PLAIN\r\n")
+	scanner.Scan()
+	if scanner.Text() != "334 " {
+		t.Fatalf("Expected 334 challenge, got: %q", scanner.Text())
+	}
+	io.WriteString(c, "!!!not-base64!!!\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "501 5.5.2 ") {
+		t.Fatalf("Expected 501 5.5.2 for invalid continuation base64, got: %q", scanner.Text())
+	}
+
+	// Extra arguments after initial response MUST be rejected with 501 5.5.4.
+	io.WriteString(c, "AUTH PLAIN dGVzdA== extra\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "501 5.5.4 ") {
+		t.Fatalf("Expected 501 5.5.4 for extra AUTH arguments, got: %q", scanner.Text())
+	}
+}
+
+func TestServer_AuthBeforeStartTLSReturns538(t *testing.T) {
+	_, s, c, scanner, _ := testServerEhlo(t, func(s *smtp.Server) {
+		s.AllowInsecureAuth = false
+	})
+	defer s.Close()
+	defer c.Close()
+
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// RFC 4954 §6: AUTH over an unencrypted connection when encryption is required MUST reply 538 5.7.11.
+	creds := base64.StdEncoding.EncodeToString([]byte("\x00username\x00password"))
+	io.WriteString(c, "AUTH PLAIN "+creds+"\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "538 5.7.11 ") {
+		t.Fatalf("Expected 538 5.7.11 for AUTH before STARTTLS, got: %q", scanner.Text())
+	}
+}
+
+func TestServer_PostmasterForwardPathOnly(t *testing.T) {
+	_, s, c, scanner, _ := testServerEhlo(t)
+	defer s.Close()
+	defer c.Close()
+
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// RFC 5321 §4.1.1.3 allows domainless <Postmaster> only in RCPT TO, never in MAIL FROM or AUTH=.
+	for _, cmd := range []string{
+		"MAIL FROM:<Postmaster>",
+		"MAIL FROM:<postmaster>",
+		`MAIL FROM:<"postmaster">`,
+		"MAIL FROM:postmaster",
+		"MAIL FROM:<root@nsa.gov> AUTH=postmaster",
+	} {
+		io.WriteString(c, cmd+"\r\n")
+		scanner.Scan()
+		if !strings.HasPrefix(scanner.Text(), "501 ") {
+			t.Fatalf("Expected 501 for %q, got: %q", cmd, scanner.Text())
+		}
+	}
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatalf("Expected 250 for valid MAIL FROM, got: %q", scanner.Text())
+	}
+
+	// Bracketed domainless <Postmaster> (case-insensitive) is valid in RCPT TO.
+	for _, cmd := range []string{
+		"RCPT TO:<Postmaster>",
+		"RCPT TO:<postmaster>",
+	} {
+		io.WriteString(c, cmd+"\r\n")
+		scanner.Scan()
+		if !strings.HasPrefix(scanner.Text(), "250 ") {
+			t.Fatalf("Expected 250 for %q, got: %q", cmd, scanner.Text())
+		}
+	}
+
+	// Quoted or unbracketed domainless postmaster is not a valid forward-path.
+	for _, cmd := range []string{
+		`RCPT TO:<"postmaster">`,
+		"RCPT TO:postmaster",
+	} {
+		io.WriteString(c, cmd+"\r\n")
+		scanner.Scan()
+		if !strings.HasPrefix(scanner.Text(), "501 5.1.3 ") {
+			t.Fatalf("Expected 501 5.1.3 for %q, got: %q", cmd, scanner.Text())
+		}
+	}
+}
+
+func TestServer_LocalPartRejectsControlCharsAndNUL(t *testing.T) {
+	_, s, c, scanner, _ := testServerEhlo(t)
+	defer s.Close()
+	defer c.Close()
+
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatalf("Expected 250 for valid MAIL FROM, got: %q", scanner.Text())
+	}
+
+	// RFC 5321 §4.1.2 forbids control characters (0x00..0x1f and 0x7f) in both
+	// dot-string and quoted-string local-parts; NUL must also return 501 5.1.3
+	// without dropping the connection.
+	for _, rcpt := range []string{
+		"RCPT TO:<a\x01b@example.test>",
+		"RCPT TO:<a\x00b@example.test>",
+		"RCPT TO:<a\x7fb@example.test>",
+		"RCPT TO:<\"a\x01b\"@example.test>",
+		"RCPT TO:<\"a\x00b\"@example.test>",
+		"RCPT TO:<\"a\x7fb\"@example.test>",
+		"RCPT TO:<\"a\\\x01b\"@example.test>",
+		"RCPT TO:<\"a\\\x00b\"@example.test>",
+	} {
+		io.WriteString(c, rcpt+"\r\n")
+		if !scanner.Scan() {
+			t.Fatalf("Connection dropped on %q (err=%v)", rcpt, scanner.Err())
+		}
+		if !strings.HasPrefix(scanner.Text(), "501 5.1.3 ") {
+			t.Fatalf("Expected 501 5.1.3 for %q, got: %q", rcpt, scanner.Text())
+		}
+	}
+
+	// Connection must remain usable after rejecting NUL/control-char paths.
+	io.WriteString(c, "RCPT TO:<valid@example.test>\r\n")
+	if !scanner.Scan() || !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatalf("Expected 250 for subsequent valid RCPT TO, got: %q", scanner.Text())
+	}
+}
