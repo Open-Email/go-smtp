@@ -68,7 +68,8 @@ type Session interface {
 	// - The client issues QUIT
 	// - The connection is closed
 	// - The client issues STARTTLS (before creating a new session)
-	// - The client issues re-EHLO/re-HELO/re-LHLO (before creating a new session)
+	// - The client issues re-EHLO/re-HELO/re-LHLO (before creating a new
+	//   session), unless GreetingSession.CheckGreeting refused it
 	Logout() error
 
 	// Set return path for currently processed message.
@@ -102,6 +103,25 @@ type LMTPSession interface {
 	//
 	// ctx carries the same per-command context as Session.Data.
 	LMTPData(ctx context.Context, r io.Reader, status StatusCollector) error
+}
+
+// GreetingSession is an add-on interface for Session. A repeated HELO, EHLO or
+// LHLO replaces the current session: the server calls Logout, resets the
+// transaction and calls Backend.NewSession again. Before any of that it calls
+// CheckGreeting on the current session with the new domain; an error is sent
+// to the client (a *SMTPError as is, anything else as 451 4.0.0) and the
+// session, the greeting and any mail transaction stay exactly as they were, as
+// RFC 5321 section 4.1.4 requires after a refused EHLO.
+//
+// Conn.Hostname and Conn.Greeting still report the current greeting during
+// the call. CheckGreeting is not called for a connection's first greeting, nor
+// for the first one after STARTTLS: there is no session to keep then, and
+// Backend.NewSession returning an error already refuses the greeting.
+type GreetingSession interface {
+	Session
+
+	// ctx carries the same per-command context as Session.Mail.
+	CheckGreeting(ctx context.Context, domain string) error
 }
 
 // StatusCollector allows a backend to provide per-recipient status
