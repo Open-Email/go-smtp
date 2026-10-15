@@ -404,6 +404,18 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Domain/address argument required for HELO")
 		return
 	}
+	// RFC 5321 section 4.1.4: a refused EHLO leaves the server in the state it
+	// was in, so a repeated greeting is vetted before anything below discards
+	// the current session.
+	if gs, ok := c.Session().(GreetingSession); ok {
+		err := c.withCommandContext(func(ctx context.Context) error {
+			return gs.CheckGreeting(ctx, domain)
+		})
+		if err != nil {
+			c.writeError(451, EnhancedCode{4, 0, 0}, err)
+			return
+		}
+	}
 	// c.helo is populated before NewSession so
 	// NewSession can access it via Conn.Hostname.
 	c.helo = domain
