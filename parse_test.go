@@ -39,9 +39,6 @@ func TestParser(t *testing.T) {
 		"<postmaster>",
 		`<"postmaster">`,
 		"postmaster",
-		"<.user@example.org>",
-		"<user.@example.org>",
-		"<u..ser@example.org>",
 		"<a\x01b@example.org>",
 		"<a\x00b@example.org>",
 		"<a\x7fb@example.org>",
@@ -55,6 +52,86 @@ func TestParser(t *testing.T) {
 		p := parser{tc}
 		if path, err := p.parseReversePath(); err == nil {
 			t.Errorf("parser.parseReversePath(%q) = %q, want error", tc, path)
+		}
+	}
+}
+
+// Leading, trailing and consecutive dots are not a valid RFC 5321 Dot-string,
+// but older Japanese carrier addresses (docomo, au/ezweb, SoftBank) still use
+// them and Postfix accepts them, so both paths accept them and hand the
+// address back unchanged (Open-Email/smtp-in#108).
+func TestParserLegacyDottedLocalParts(t *testing.T) {
+	cases := []struct {
+		raw, path, after string
+	}{
+		{"<taro..yamada@docomo.ne.jp>", "taro..yamada@docomo.ne.jp", ""},
+		{"<foo.@ezweb.ne.jp>", "foo.@ezweb.ne.jp", ""},
+		{"<.foo@example.com>", ".foo@example.com", ""},
+		{"<.a..b.@example.com> SIZE=10", ".a..b.@example.com", " SIZE=10"},
+		{"taro..yamada@docomo.ne.jp", "taro..yamada@docomo.ne.jp", ""},
+	}
+	parsers := []struct {
+		name  string
+		parse func(*parser) (string, error)
+	}{
+		{"parseReversePath", (*parser).parseReversePath},
+		{"parseForwardPath", (*parser).parseForwardPath},
+	}
+	for _, pp := range parsers {
+		for _, tc := range cases {
+			p := parser{tc.raw}
+			path, err := pp.parse(&p)
+			if err != nil {
+				t.Errorf("parser.%s(%q) = %v", pp.name, tc.raw, err)
+			} else if path != tc.path {
+				t.Errorf("parser.%s(%q) = %q, want %q", pp.name, tc.raw, path, tc.path)
+			} else if p.s != tc.after {
+				t.Errorf("parser.%s(%q): got after = %q, want %q", pp.name, tc.raw, p.s, tc.after)
+			}
+		}
+	}
+}
+
+// Accepting legacy dots must not loosen anything else: control characters,
+// NUL, whitespace and the RFC 5322 specials other than '.' stay refused in an
+// unquoted local part on both paths, dotted or not.
+func TestParserLocalPartRefusals(t *testing.T) {
+	cases := []string{
+		"<a\x01b@example.org>",
+		"<a\x00b@example.org>",
+		"<a\x7fb@example.org>",
+		"<a\x1fb@example.org>",
+		"<taro..\x01yamada@docomo.ne.jp>",
+		"<foo.\x00@ezweb.ne.jp>",
+		"<.\x7ffoo@example.com>",
+		"<a b@example.org>",
+		"<a\tb@example.org>",
+		"<a(b@example.org>",
+		"<a)b@example.org>",
+		"<a,b@example.org>",
+		"<a;b@example.org>",
+		"<a[b@example.org>",
+		"<a]b@example.org>",
+		"<a\\b@example.org>",
+		"<a\"b@example.org>",
+		"<a<b@example.org>",
+		"<a..b,c@example.org>",
+		"<\"a\x01b\"@example.org>",
+		"<\"a\x00b\"@example.org>",
+	}
+	parsers := []struct {
+		name  string
+		parse func(*parser) (string, error)
+	}{
+		{"parseReversePath", (*parser).parseReversePath},
+		{"parseForwardPath", (*parser).parseForwardPath},
+	}
+	for _, pp := range parsers {
+		for _, tc := range cases {
+			p := parser{tc}
+			if path, err := pp.parse(&p); err == nil {
+				t.Errorf("parser.%s(%q) = %q, want error", pp.name, tc, path)
+			}
 		}
 	}
 }
