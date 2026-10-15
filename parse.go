@@ -264,10 +264,12 @@ func (p *parser) parseLocalPart() (string, error) {
 			sb.WriteByte(ch)
 		}
 	done:
-		s := sb.String()
-		if strings.HasPrefix(s, ".") || strings.HasSuffix(s, ".") || strings.Contains(s, "..") {
-			return "", fmt.Errorf("malformed dot-string")
-		}
-		return s, nil
+		// Leading, trailing and consecutive dots are not a valid RFC 5321
+		// Dot-string, but they are accepted on purpose, as Postfix does:
+		// older Japanese carrier addresses (docomo, au/ezweb, SoftBank)
+		// still use them in large numbers, and refusing them at MAIL FROM
+		// bounces their mail (Open-Email/smtp-in#108). Every other refusal
+		// above stands.
+		return sb.String(), nil
 	}
 }

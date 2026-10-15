@@ -548,3 +548,122 @@ func TestServer_LocalPartRejectsControlCharsAndNUL(t *testing.T) {
 		t.Fatalf("Expected 250 for subsequent valid RCPT TO, got: %q", scanner.Text())
 	}
 }
+
+// Older Japanese carrier addresses (docomo, au/ezweb, SoftBank) still carry
+// leading, trailing or consecutive dots in their local parts. They are not a
+// valid RFC 5321 Dot-string, but Postfix accepts them and so must we on both
+// MAIL FROM and RCPT TO (Open-Email/smtp-in#108), handing the backend the
+// address exactly as the client sent it.
+func TestServer_LegacyDottedLocalParts(t *testing.T) {
+	be, s, c, scanner, _ := testServerEhlo(t)
+	defer s.Close()
+	defer c.Close()
+
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// send reports a wrong reply without stopping, so one run shows every
+	// refused form on both paths.
+	send := func(cmd, wantPrefix string) bool {
+		t.Helper()
+		io.WriteString(c, cmd+"\r\n")
+		if !scanner.Scan() {
+			t.Fatalf("Connection dropped on %q (err=%v)", cmd, scanner.Err())
+		}
+		if !strings.HasPrefix(scanner.Text(), wantPrefix) {
+			t.Errorf("Expected %q for %q, got: %q", wantPrefix, cmd, scanner.Text())
+			return false
+		}
+		return true
+	}
+	deliver := func() *message {
+		t.Helper()
+		n := len(be.anonmsgs)
+		if !send("DATA", "354 ") {
+			t.FailNow()
+		}
+		io.WriteString(c, "Subject: hi\r\n\r\nbody\r\n")
+		if !send(".", "250 ") || len(be.anonmsgs) != n+1 {
+			t.FailNow()
+		}
+		return be.anonmsgs[n]
+	}
+
+	legacy := []string{
+		"taro..yamada@docomo.ne.jp",
+		"foo.@ezweb.ne.jp",
+		".foo@example.com",
+	}
+
+	// RCPT TO: every legacy form is accepted and reaches the backend as sent.
+	send("MAIL FROM:<normal.name@example.com>", "250 ")
+	var accepted []string
+	for _, addr := range append([]string{"normal.name@example.com"}, legacy...) {
+		if send("RCPT TO:<"+addr+">", "250 ") {
+			accepted = append(accepted, addr)
+		}
+	}
+	msg := deliver()
+	if fmt.Sprint(msg.To) != fmt.Sprint(accepted) {
+		t.Errorf("RCPT TO reached the backend as %q, want %q", msg.To, accepted)
+	}
+
+	// MAIL FROM: the same, one transaction per form.
+	for _, addr := range legacy {
+		if !send("MAIL FROM:<"+addr+">", "250 ") {
+			continue
+		}
+		send("RCPT TO:<normal.name@example.com>", "250 ")
+		if msg := deliver(); msg.From != addr {
+			t.Errorf("MAIL FROM:<%s> reached the backend as %q", addr, msg.From)
+		}
+	}
+
+	// The AUTH= mailbox (RFC 4954 §5) shares the local-part parser.
+	if send("MAIL FROM:<normal.name@example.com> AUTH=foo.@ezweb.ne.jp", "250 ") {
+		if opts := be.sessions[0].msg.Opts; opts == nil || opts.Auth == nil || *opts.Auth != "foo.@ezweb.ne.jp" {
+			t.Errorf("AUTH=foo.@ezweb.ne.jp reached the backend as %+v", opts)
+		}
+		send("RSET", "250 ")
+	}
+}
+
+// Accepting legacy dots must not loosen any other MAIL FROM refusal: control
+// characters, NUL, whitespace and the specials other than '.' still get 501,
+// dotted or not, and the connection stays usable.
+func TestServer_MailFromLocalPartRefusals(t *testing.T) {
+	_, s, c, scanner, _ := testServerEhlo(t)
+	defer s.Close()
+	defer c.Close()
+
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+
+	for _, cmd := range []string{
+		"MAIL FROM:<a\x01b@example.test>",
+		"MAIL FROM:<a\x00b@example.test>",
+		"MAIL FROM:<a\x7fb@example.test>",
+		"MAIL FROM:<taro..\x01yamada@docomo.ne.jp>",
+		"MAIL FROM:<foo.\x00@ezweb.ne.jp>",
+		"MAIL FROM:<.\x7ffoo@example.com>",
+		"MAIL FROM:<\"a\x01b\"@example.test>",
+		"MAIL FROM:<\"a\x00b\"@example.test>",
+		"MAIL FROM:<a,b@example.test>",
+		"MAIL FROM:<a;b@example.test>",
+		"MAIL FROM:<a(b@example.test>",
+		"MAIL FROM:<a[b@example.test>",
+		"MAIL FROM:<a\\b@example.test>",
+		"MAIL FROM:<a..b,c@example.test>",
+	} {
+		io.WriteString(c, cmd+"\r\n")
+		if !scanner.Scan() {
+			t.Fatalf("Connection dropped on %q (err=%v)", cmd, scanner.Err())
+		}
+		if !strings.HasPrefix(scanner.Text(), "501 ") {
+			t.Fatalf("Expected 501 for %q, got: %q", cmd, scanner.Text())
+		}
+	}
+
+	io.WriteString(c, "MAIL FROM:<valid@example.test>\r\n")
+	if !scanner.Scan() || !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatalf("Expected 250 for subsequent valid MAIL FROM, got: %q", scanner.Text())
+	}
+}
