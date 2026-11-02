@@ -394,6 +394,10 @@ func (s *Server) Close() error {
 	return err
 }
 
+// CloseIdle answers 421 4.3.2 and closes every connection that is waiting for
+// a command. Not implemented yet.
+func (s *Server) CloseIdle() {}
+
 // Shutdown gracefully shuts down the server without interrupting any
 // active connections. Shutdown works by first closing all open
 // listeners and then waiting indefinitely for connections to return to
