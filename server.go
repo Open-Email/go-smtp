@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -141,6 +142,8 @@ type Server struct {
 	locker    sync.Mutex
 	listeners []net.Listener
 	conns     map[*Conn]struct{}
+
+	closingIdle atomic.Bool // set by CloseIdle
 }
 
 // New creates a new SMTP server.
@@ -285,7 +288,11 @@ func (s *Server) handleConn(c *Conn) error {
 			return c.writeFailure
 		}
 
-		line, err := c.readLine()
+		line, closing, err := c.readCommand()
+		if closing {
+			c.writeResponse(421, EnhancedCode{4, 3, 2}, "Server is shutting down, please try again later")
+			return nil
+		}
 		if err != nil {
 			return c.readError(err)
 		}
@@ -392,6 +399,29 @@ func (s *Server) Close() error {
 	s.locker.Unlock()
 
 	return err
+}
+
+// CloseIdle answers 421 4.3.2 and closes every connection that is waiting for
+// a command, and from then on every other connection as soon as it next waits
+// for one. A command in progress, including a DATA or BDAT transfer and the
+// Session.Data call that delivers it, finishes and gets its reply first;
+// between the chunks of a BDAT transfer a connection is not waiting for a
+// command. A connection between commands has nothing in flight, so its
+// client loses nothing and retries (RFC 5321 section 3.8).
+//
+// CloseIdle neither closes the listeners nor waits. A server shutting down
+// calls it once it stops accepting, then waits for its connections to end:
+// the wait lasts as long as the work in flight rather than as long as an
+// idle client may hold its connection. Unlike Shutdown, it does not cancel
+// any connection's context.
+func (s *Server) CloseIdle() {
+	s.closingIdle.Store(true)
+
+	s.locker.Lock()
+	defer s.locker.Unlock()
+	for c := range s.conns {
+		c.interruptIdle()
+	}
 }
 
 // Shutdown gracefully shuts down the server without interrupting any

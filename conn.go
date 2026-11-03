@@ -44,6 +44,10 @@ type Conn struct {
 	// Number of failed AUTH attempts witnessed on this connection
 	authFailures int
 
+	// The serve loop is waiting for a command line outside a BDAT transfer,
+	// which Server.CloseIdle interrupts. Guarded by locker.
+	idle bool
+
 	// First error encountered while writing a response. Once set, the serve
 	// loop tears the connection down: the client can no longer observe
 	// replies, so processing further commands is pointless. Only accessed
@@ -1757,10 +1761,57 @@ func (c *Conn) writeError(code int, enhCode EnhancedCode, err error) {
 	}
 }
 
+// readCommand reads the next command line. closing reports that
+// Server.CloseIdle has closed the connection instead: it was called before
+// the wait began, or during it, which interrupts the read. A line that
+// arrived as it did is not served, since its read deadline has passed.
+func (c *Conn) readCommand() (line string, closing bool, err error) {
+	// Arm the read deadline before the wait is visible to CloseIdle, so that
+	// arming it cannot undo the interruption.
+	if err := c.armReadDeadline(); err != nil {
+		return "", false, err
+	}
+
+	c.locker.Lock()
+	inBdat := c.bdatPipe != nil
+	if !inBdat && c.server.closingIdle.Load() {
+		c.locker.Unlock()
+		return "", true, nil
+	}
+	c.idle = !inBdat
+	c.locker.Unlock()
+
+	line, err = c.readArmedLine()
+
+	c.locker.Lock()
+	closing = c.idle && c.server.closingIdle.Load()
+	c.idle = false
+	c.locker.Unlock()
+	return line, closing, err
+}
+
+// interruptIdle makes a read that is waiting for a command return at once.
+func (c *Conn) interruptIdle() {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	if c.idle {
+		c.conn.SetReadDeadline(time.Now())
+	}
+}
+
 // Reads a line of input, enforcing Server.MaxLineLength on the line itself
 // (excluding CRLF). Bytes buffered behind the line — such as a pipelined BDAT
 // chunk following its command — do not count toward the limit.
 func (c *Conn) readLine() (string, error) {
+	if err := c.armReadDeadline(); err != nil {
+		return "", err
+	}
+	return c.readArmedLine()
+}
+
+// armReadDeadline sets the read deadline for the next line: the session
+// deadline, or ReadTimeout from now if that comes first.
+func (c *Conn) armReadDeadline() error {
 	deadline, configured := c.getSessionDeadline()
 	if c.server.ReadTimeout != 0 {
 		idleDeadline := time.Now().Add(c.server.ReadTimeout)
@@ -1769,11 +1820,12 @@ func (c *Conn) readLine() (string, error) {
 		}
 	}
 	if configured || !deadline.IsZero() {
-		if err := c.conn.SetReadDeadline(deadline); err != nil {
-			return "", err
-		}
+		return c.conn.SetReadDeadline(deadline)
 	}
+	return nil
+}
 
+func (c *Conn) readArmedLine() (string, error) {
 	var line []byte
 	for {
 		l, more, err := c.text.R.ReadLine()
