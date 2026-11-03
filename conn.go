@@ -71,6 +71,12 @@ type Conn struct {
 	bdatPipe      *io.PipeWriter
 	bdatCtxCancel context.CancelFunc // cancels the in-flight BDAT command context on abort
 	bdatStatus    *statusCollector   // used for BDAT on LMTP
+	// Closed when the BDAT Data goroutine has returned; nil when none runs.
+	// No other Session callback may overlap Data (see stopBdat), so a Logout
+	// that Close cannot run yet waits in bdatLogout for the goroutine to run
+	// it. Both guarded by locker.
+	bdatDone      chan struct{}
+	bdatLogout    Session
 	dataResult    chan error
 	bytesReceived int64 // counts total size of chunks when BDAT is used
 
@@ -291,6 +297,14 @@ func (c *Conn) Close() error {
 	}
 	session := c.session
 	c.session = nil
+	if session != nil && c.bdatDone != nil {
+		// A BDAT Data call is still unwinding. Logout must not overlap it,
+		// and Close must not wait for it: Close may run on another goroutine
+		// (Server.Close) or inside that very Data call. The goroutine logs
+		// the session out once Data has returned.
+		c.bdatLogout = session
+		session = nil
+	}
 	conn := c.conn
 	c.locker.Unlock()
 
@@ -437,6 +451,7 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 		// and reset the state exactly as if a RSET command has been issued."
 
 		// Free session resources before resetting
+		c.stopBdat()
 		if err := c.logoutSession(session); err != nil {
 			c.server.ErrorLog.Printf("Failed to logout session on re-EHLO: %v", err)
 		}
@@ -1276,6 +1291,7 @@ func (c *Conn) handleStartTLS() {
 	// be able to see the information about TLS connection in the
 	// ConnectionState object passed to it.
 	if session := c.Session(); session != nil {
+		c.stopBdat()
 		c.logoutSession(session)
 		c.setSession(nil)
 	}
@@ -1377,7 +1393,10 @@ func (c *Conn) handleBdat(arg string) {
 		var r *io.PipeReader
 		r, c.bdatPipe = io.Pipe()
 
-		c.dataResult = make(chan error, 1)
+		// The goroutine answers on its own channel: c.dataResult belongs to
+		// whichever transaction is current when it finishes.
+		result := make(chan error, 1)
+		c.dataResult = result
 
 		// The data goroutine runs concurrently with the serve loop, which can
 		// abort the transfer (RSET, Close) and clear connection state under
@@ -1391,17 +1410,20 @@ func (c *Conn) handleBdat(arg string) {
 		// ErrDataReset; register the cancel on the Conn so reset() and
 		// Close() can deliver the abort through the context.
 		dataCtx, dataCancel := context.WithCancel(c.Context())
+		done := make(chan struct{})
 		c.locker.Lock()
 		c.bdatCtxCancel = dataCancel
+		c.bdatDone = done
 		c.locker.Unlock()
 
 		go func() {
+			defer c.endBdat(done)
 			defer dataCancel()
 			defer func() {
 				if err := recover(); err != nil {
 					c.handlePanic(err, bdatStatus)
 
-					c.dataResult <- errPanic
+					result <- errPanic
 					r.CloseWithError(errPanic)
 				}
 			}()
@@ -1421,7 +1443,7 @@ func (c *Conn) handleBdat(arg string) {
 				}
 			}
 
-			c.dataResult <- err
+			result <- err
 			r.CloseWithError(err)
 		}()
 	}
@@ -1469,6 +1491,48 @@ func (c *Conn) handleBdat(arg string) {
 	} else {
 		c.writeResponse(250, EnhancedCode{2, 0, 0}, "Continue")
 	}
+}
+
+// stopBdat aborts a BDAT transfer in progress and waits for its Session.Data
+// call to return, so that the Reset or Logout which follows does not run
+// alongside it (Open-Email/smtp-in#204). The reader fails with ErrDataReset
+// and the command context is cancelled, so the wait lasts as long as the
+// backend takes to honour either. Called on the serve goroutine only.
+func (c *Conn) stopBdat() {
+	c.locker.Lock()
+	if c.bdatPipe != nil {
+		c.bdatPipe.CloseWithError(ErrDataReset)
+		c.bdatPipe = nil
+	}
+	if c.bdatCtxCancel != nil {
+		// The pipe error only reaches a backend that is reading the message;
+		// cancelling the command context aborts one blocked in upstream I/O.
+		c.bdatCtxCancel()
+		c.bdatCtxCancel = nil
+	}
+	done := c.bdatDone
+	c.locker.Unlock()
+
+	if done != nil {
+		<-done
+	}
+}
+
+// endBdat runs on the BDAT goroutine once Session.Data has returned: it runs
+// the Logout that Close left to it, then releases stopBdat.
+func (c *Conn) endBdat(done chan struct{}) {
+	c.locker.Lock()
+	if c.bdatDone == done {
+		c.bdatDone = nil
+	}
+	session := c.bdatLogout
+	c.bdatLogout = nil
+	c.locker.Unlock()
+
+	if session != nil {
+		c.logoutSession(session)
+	}
+	close(done)
 }
 
 // ErrDataReset is returned by Reader pased to Data function if client does not
@@ -2035,17 +2099,9 @@ func (c *Conn) reset() {
 	// the connection goroutine for the rest of the connection's life. That hangs
 	// every RSET and every message completion (handleData resets on return), and
 	// the goroutine, socket and session are never released.
+	c.stopBdat()
+
 	c.locker.Lock()
-	if c.bdatPipe != nil {
-		c.bdatPipe.CloseWithError(ErrDataReset)
-		c.bdatPipe = nil
-	}
-	if c.bdatCtxCancel != nil {
-		// The pipe error only reaches a backend that is reading the message;
-		// cancelling the command context aborts one blocked in upstream I/O.
-		c.bdatCtxCancel()
-		c.bdatCtxCancel = nil
-	}
 	c.bdatStatus = nil
 	c.bytesReceived = 0
 	c.fromReceived = false
