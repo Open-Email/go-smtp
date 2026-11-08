@@ -1133,8 +1133,12 @@ func (c *Conn) handleAuth(arg string) {
 		return
 	}
 
+	// RFC 4954 §4: a mechanism that requires an encryption layer is invalid
+	// here, so reject it with 504 5.5.4. The 538 5.7.11 reply is kept in §6
+	// for historical purposes only and is deprecated by §15. EHLO does not
+	// advertise AUTH until it is allowed, as §6 asks.
 	if !c.authAllowed() {
-		c.writeResponse(538, EnhancedCode{5, 7, 11}, "Encryption required for requested authentication mechanism")
+		c.writeResponse(504, EnhancedCode{5, 5, 4}, "Mechanism requires an encrypted connection")
 		return
 	}
 
