@@ -13,11 +13,10 @@ import (
 // client that follows both sends its mail straight after the second EHLO, without
 // authenticating again.
 //
-// Unless the session implements ReGreetingSession, a successful re-EHLO replaces the backend
-// session with a fresh one from NewSession, which never saw Auth, while the connection stays
-// marked as authenticated. The client cannot log in again (503), and its mail reaches a
-// session that treats it as anonymous. The test backend here does not implement
-// ReGreetingSession, so it exercises that default path.
+// Replacing the backend session after AUTH would create one that never saw Auth,
+// while the connection stays marked as authenticated. The client could not log in
+// again (503), and mail would reach a session that treats it as anonymous. This
+// test uses the default backend without an optional greeting hook.
 func TestServer_AuthSurvivesReEhlo(t *testing.T) {
 	be, s, c, scanner, _ := testServerEhlo(t)
 	defer s.Close()

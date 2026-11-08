@@ -61,8 +61,6 @@ func TestNewSessionRefusalPreservesGreetingAndTransaction(t *testing.T) {
 					send(firstCommand+" original.example", "250")
 					c, old := <-connections, <-oldSessions
 					original := c.Session()
-					// A refusal must preserve authentication as well as the envelope.
-					send("AUTH PLAIN AHVzZXJuYW1lAHBhc3N3b3Jk", "235")
 					send("MAIL FROM:<sender@example.com>", "250")
 					send("RCPT TO:<recipient@example.com>", "250")
 					code := "550"
@@ -79,7 +77,6 @@ func TestNewSessionRefusalPreservesGreetingAndTransaction(t *testing.T) {
 					if old.getLogoutCount() != 0 {
 						t.Fatal("refusal logged out the old session")
 					}
-					send("AUTH PLAIN AHVzZXJuYW1lAHBhc3N3b3Jk", "503")
 					send("DATA", "354")
 					io.WriteString(conn, "Subject: retained\r\n\r\nbody\r\n.\r\n")
 					readGreetingReply(t, scanner, "250")
@@ -94,17 +91,13 @@ type reusableGreetingSession struct {
 	*session
 	conn     *smtp.Conn
 	resets   atomic.Int32
-	check    func(context.Context, string, string) error
+	check    func(context.Context, string) error
 	onLogout func()
 }
 
 func (s *reusableGreetingSession) Reset() {
 	s.resets.Add(1)
 	s.session.Reset()
-}
-
-func (s *reusableGreetingSession) ReGreeting(ctx context.Context, domain, command string) error {
-	return s.check(ctx, domain, command)
 }
 
 func (s *reusableGreetingSession) Logout() error {
@@ -114,11 +107,11 @@ func (s *reusableGreetingSession) Logout() error {
 	return s.session.Logout()
 }
 
-func (s *reusableGreetingSession) CheckGreeting(context.Context, string) error {
-	return errors.New("CheckGreeting must not run when ReGreeting is implemented")
+func (s *reusableGreetingSession) CheckGreeting(ctx context.Context, domain string) error {
+	return s.check(ctx, domain)
 }
 
-func TestReGreetingReusesSessionAndResetsOnlyOnSuccess(t *testing.T) {
+func TestNewSessionReusesSessionAndResetsOnlyOnSuccess(t *testing.T) {
 	for _, command := range []string{"HELO", "EHLO", "LHLO"} {
 		t.Run(command, func(t *testing.T) {
 			var created atomic.Int32
@@ -128,18 +121,19 @@ func TestReGreetingReusesSessionAndResetsOnlyOnSuccess(t *testing.T) {
 				s.LMTP = command == "LHLO"
 				be := s.Backend.(*backend)
 				s.Backend = smtp.BackendFunc(func(c *smtp.Conn) (smtp.Session, error) {
-					if created.Add(1) > 1 {
-						return nil, errors.New("only one live session is allowed")
+					if old := c.Session(); old != nil {
+						return old, nil // keep the single live session and its resources
 					}
+					created.Add(1)
 					inner, err := be.NewSession(c)
 					if err != nil {
 						return nil, err
 					}
 					sess := &reusableGreetingSession{session: inner.(*session), conn: c}
-					sess.check = func(ctx context.Context, domain, proposed string) error {
+					sess.check = func(ctx context.Context, domain string) error {
 						contexts <- ctx
-						if c.Hostname() != "original.example" || c.Greeting() != command || proposed != command {
-							return errors.New("ReGreeting saw incorrect greeting metadata")
+						if c.Hostname() != "original.example" || c.Greeting() != command {
+							return errors.New("CheckGreeting saw incorrect greeting metadata")
 						}
 						if domain == "refused.example" {
 							return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "Greeting refused"}
@@ -161,7 +155,6 @@ func TestReGreetingReusesSessionAndResetsOnlyOnSuccess(t *testing.T) {
 			}
 			send(command+" original.example", "250")
 			sess := <-sessions
-			send("AUTH PLAIN AHVzZXJuYW1lAHBhc3N3b3Jk", "235")
 			send("MAIL FROM:<sender@example.com>", "250")
 			send("RCPT TO:<recipient@example.com>", "250")
 			send(command+" refused.example", "550")
@@ -172,7 +165,7 @@ func TestReGreetingReusesSessionAndResetsOnlyOnSuccess(t *testing.T) {
 			select {
 			case <-ctx.Done():
 			default:
-				t.Fatal("ReGreeting context was not cancelled on return")
+				t.Fatal("CheckGreeting context was not cancelled on return")
 			}
 			send("DATA", "354")
 			io.WriteString(conn, "Subject: retained\r\n\r\nbody\r\n.\r\n")
@@ -189,8 +182,19 @@ func TestReGreetingReusesSessionAndResetsOnlyOnSuccess(t *testing.T) {
 				t.Fatal("accepted re-greeting did not reset the transaction or update metadata")
 			}
 			send("DATA", "502")
-			send("AUTH PLAIN AHVzZXJuYW1lAHBhc3N3b3Jk", "503")
+			send("AUTH PLAIN AHVzZXJuYW1lAHBhc3N3b3Jk", "235")
 			send("QUIT", "221")
+			if scanner.Scan() {
+				t.Fatalf("unexpected reply after QUIT: %q", scanner.Text())
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if sess.getLogoutCount() != 1 {
+				t.Fatalf("reused session was logged out %d times, want 1", sess.getLogoutCount())
+			}
 		})
 	}
 }
@@ -253,9 +257,14 @@ func TestServerCloseDuringNewSessionReplacement(t *testing.T) {
 
 type closeObservedSession struct {
 	ctxSession
+	resets        atomic.Int32
 	logouts       atomic.Int32
 	loggedOut     chan<- struct{}
 	panicOnLogout bool
+}
+
+func (s *closeObservedSession) Reset() {
+	s.resets.Add(1)
 }
 
 func (s *closeObservedSession) Logout() error {
@@ -293,7 +302,7 @@ func TestReplacementSessionCleanedUpWhenOldLogoutPanics(t *testing.T) {
 	}
 }
 
-func TestServerCloseSerializesLogoutWithReGreeting(t *testing.T) {
+func TestServerCloseDoesNotWaitForGreetingCheck(t *testing.T) {
 	entered, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var inCallback atomic.Bool
 	logoutDuringCallback := make(chan bool, 1)
@@ -305,7 +314,7 @@ func TestServerCloseSerializesLogoutWithReGreeting(t *testing.T) {
 				return nil, err
 			}
 			sess := &reusableGreetingSession{session: inner.(*session), conn: c}
-			sess.check = func(ctx context.Context, _, _ string) error {
+			sess.check = func(ctx context.Context, _ string) error {
 				inCallback.Store(true)
 				defer inCallback.Store(false)
 				close(entered)
@@ -333,13 +342,16 @@ func TestServerCloseSerializesLogoutWithReGreeting(t *testing.T) {
 	io.WriteString(conn, "EHLO original.example\r\n")
 	readGreetingReply(t, scanner, "250")
 	io.WriteString(conn, "EHLO candidate.example\r\n")
-	wait(entered, "ReGreeting did not start")
+	wait(entered, "CheckGreeting did not start")
 	closed := make(chan struct{})
 	go func() { defer close(closed); srv.Close() }()
-	wait(cancelled, "shutdown did not cancel ReGreeting's context")
-	release <- struct{}{}
-	wait(closed, "shutdown did not finish")
-	if <-logoutDuringCallback {
-		t.Fatal("Logout ran concurrently with ReGreeting")
+	wait(cancelled, "shutdown did not cancel CheckGreeting's context")
+	wait(closed, "shutdown waited for the blocked greeting policy")
+	if !<-logoutDuringCallback {
+		t.Fatal("shutdown did not release the session while the policy was blocked")
 	}
+	if scanner.Scan() {
+		t.Fatalf("unexpected response after Close: %q", scanner.Text())
+	}
+	release <- struct{}{}
 }
