@@ -178,9 +178,9 @@ func TestBdatAbort_CallbacksWaitForData(t *testing.T) {
 		abort    func(c *bdatClient)
 	}{
 		{name: "RSET", callback: "reset", abort: func(c *bdatClient) { c.cmd("RSET", "250") }},
-		// A repeated greeting, and STARTTLS, log the session out and start a
-		// new one.
-		{name: "EHLO", callback: "logout", abort: func(c *bdatClient) { c.cmd("EHLO client.example.com", "250") }},
+		// STARTTLS logs the session out so the post-TLS greeting starts a new
+		// one. A repeated greeting during BDAT is refused without touching the
+		// transfer; see TestGreetingDuringBDATLeavesTransferIntact.
 		{name: "STARTTLS", callback: "logout", config: []serverConfigureFunc{withTLS}, abort: func(c *bdatClient) {
 			c.cmd("STARTTLS", "220")
 			if err := tls.Client(c.conn, &tls.Config{InsecureSkipVerify: true}).Handshake(); err != nil {

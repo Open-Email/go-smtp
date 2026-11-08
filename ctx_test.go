@@ -162,12 +162,12 @@ func TestBackendPanic_CancelsCommandContext(t *testing.T) {
 	go io.Copy(io.Discard, clientConn) // drain the 421 written by the recover path
 
 	c := newConn(serverConn, server)
-	c.helo = "client.example.com"
+	c.setGreeting("client.example.com", "EHLO")
 	session, err := backend.NewSession(c)
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
-	c.setSession(session)
+	c.swapSession(session)
 
 	c.handle("MAIL", "FROM:<sender@example.com>")
 

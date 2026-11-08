@@ -10,6 +10,11 @@ import "time"
 // Backends can set it in NewSession and extend it after successful delivery.
 // Updates are safe from other goroutines and apply on the next read or command;
 // already-running backend work must enforce its own context/deadline.
+//
+// This is an operational policy, not an RFC requirement. RFC 5321 section
+// 4.5.3.2.7 recommends that a server wait at least 5 minutes for the next
+// command, so a deadline that leaves less than that between commands can cut
+// off a client that is still within the RFC's timeouts.
 func (c *Conn) SetSessionDeadline(deadline time.Time) {
 	c.locker.Lock()
 	c.sessionDeadline = deadline

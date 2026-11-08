@@ -32,6 +32,24 @@ var (
 
 // A SMTP server backend.
 type Backend interface {
+	// NewSession creates a session for the proposed Conn.Hostname and
+	// Conn.Greeting. On a repeated greeting, Conn.Session still holds the old
+	// session. Returning that same comparable Session value (normally a pointer)
+	// reuses it: the server calls Reset instead of Logout. This lets a backend
+	// keep a limiter slot or a registry entry keyed by *Conn.
+	//
+	// Returning a different session replaces the old one only on success.
+	// NewSession runs before the old Logout, so both sessions' resources overlap
+	// briefly. Registry cleanup in Logout must remove only its own entry.
+	// A refusal retains the old session and transaction and restores the old
+	// greeting and session deadline. Deadline updates made during NewSession
+	// belong to the proposed greeting and are discarded on error or panic.
+	//
+	// After successful AUTH, repeated greetings retain the authenticated session
+	// without calling NewSession; implement GreetingSession to validate them.
+	// Backend greeting callbacks run without a Conn lock held and may call Close.
+	// They are not called during an unfinished BDAT transfer: the greeting is
+	// refused and the client must finish the transfer or issue RSET first.
 	NewSession(c *Conn) (Session, error)
 }
 
@@ -68,8 +86,9 @@ type Session interface {
 	// - The client issues QUIT
 	// - The connection is closed
 	// - The client issues STARTTLS (before creating a new session)
-	// - The client issues re-EHLO/re-HELO/re-LHLO (before creating a new
-	//   session), unless GreetingSession.CheckGreeting refused it
+	// - A repeated HELO/EHLO/LHLO successfully creates a replacement session
+	//   (after NewSession returns). Returning the existing session reuses it;
+	//   authenticated sessions are also retained across repeated greetings.
 	Logout() error
 
 	// Set return path for currently processed message.
@@ -105,18 +124,20 @@ type LMTPSession interface {
 	LMTPData(ctx context.Context, r io.Reader, status StatusCollector) error
 }
 
-// GreetingSession is an add-on interface for Session. A repeated HELO, EHLO or
-// LHLO replaces the current session: the server calls Logout, resets the
-// transaction and calls Backend.NewSession again. Before any of that it calls
-// CheckGreeting on the current session with the new domain; an error is sent
-// to the client (a *SMTPError as is, anything else as 451 4.0.0) and the
-// session, the greeting and any mail transaction stay exactly as they were, as
-// RFC 5321 section 4.1.4 requires after a refused EHLO.
+// GreetingSession is an add-on interface for Session. CheckGreeting validates a
+// repeated HELO, EHLO or LHLO before any state changes. An error is sent to the
+// client (a *SMTPError as is, anything else as 451 4.0.0), preserving the current
+// greeting, session and mail transaction (RFC 5321 section 4.1.4).
 //
-// Conn.Hostname and Conn.Greeting still report the current greeting during
-// the call. CheckGreeting is not called for a connection's first greeting, nor
-// for the first one after STARTTLS: there is no session to keep then, and
+// Conn.Hostname and Conn.Greeting still report the current greeting during the
+// call. CheckGreeting is also called after AUTH, when an accepted greeting resets
+// only the transaction and retains the authenticated session. Otherwise the
+// server calls Backend.NewSession, which may reuse or replace the old session.
+//
+// CheckGreeting is not called for a connection's first greeting, nor for the
+// first one after STARTTLS or XCLIENT: no session exists to keep then, and
 // Backend.NewSession returning an error already refuses the greeting.
+// It is not called during an unfinished BDAT transfer.
 type GreetingSession interface {
 	Session
 

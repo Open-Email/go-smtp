@@ -436,7 +436,7 @@ func TestServer_AuthInvalidBase64Returns501(t *testing.T) {
 	}
 }
 
-func TestServer_AuthBeforeStartTLSReturns538(t *testing.T) {
+func TestServer_AuthBeforeStartTLSReturns504(t *testing.T) {
 	_, s, c, scanner, _ := testServerEhlo(t, func(s *smtp.Server) {
 		s.AllowInsecureAuth = false
 	})
@@ -445,12 +445,14 @@ func TestServer_AuthBeforeStartTLSReturns538(t *testing.T) {
 
 	c.SetDeadline(time.Now().Add(10 * time.Second))
 
-	// RFC 4954 §6: AUTH over an unencrypted connection when encryption is required MUST reply 538 5.7.11.
+	// RFC 4954 §4: a mechanism that requires an encryption layer is rejected
+	// with 504, and SHOULD carry 5.5.4. The 538 5.7.11 reply in §6 is kept for
+	// historical purposes only and deprecated by §15.
 	creds := base64.StdEncoding.EncodeToString([]byte("\x00username\x00password"))
 	io.WriteString(c, "AUTH PLAIN "+creds+"\r\n")
 	scanner.Scan()
-	if !strings.HasPrefix(scanner.Text(), "538 5.7.11 ") {
-		t.Fatalf("Expected 538 5.7.11 for AUTH before STARTTLS, got: %q", scanner.Text())
+	if !strings.HasPrefix(scanner.Text(), "504 5.5.4 ") {
+		t.Fatalf("Expected 504 5.5.4 for AUTH before STARTTLS, got: %q", scanner.Text())
 	}
 }
 
