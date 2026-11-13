@@ -40,6 +40,10 @@ type Client struct {
 	CommandTimeout time.Duration
 	// Time to wait for responses after final dot.
 	SubmissionTimeout time.Duration
+	// Time to wait for the reply to QUIT. Zero means CommandTimeout. Quit
+	// closes the connection when it runs out, so a server that never answers
+	// QUIT holds the connection for this long at most.
+	QuitTimeout time.Duration
 
 	// Logger for all network activity.
 	DebugWriter io.Writer
@@ -92,7 +96,7 @@ func DialStartTLS(addr string, tlsConfig *tls.Config) (*Client, error) {
 		return nil, err
 	}
 	if err := initStartTLS(c, tlsConfig); err != nil {
-		c.Close()
+		c.endAfterSetupError(err)
 		return nil, err
 	}
 	return c, nil
@@ -110,6 +114,7 @@ func NewClient(conn net.Conn) *Client {
 		// 10 minutes + 2 minute buffer in case the server is doing transparent
 		// forwarding and also follows recommended timeouts.
 		SubmissionTimeout: 12 * time.Minute,
+		QuitTimeout:       10 * time.Second,
 	}
 
 	c.setConn(conn)
@@ -121,7 +126,7 @@ func NewClient(conn net.Conn) *Client {
 func NewClientStartTLS(conn net.Conn, tlsConfig *tls.Config) (*Client, error) {
 	c := NewClient(conn)
 	if err := initStartTLS(c, tlsConfig); err != nil {
-		c.Close()
+		c.endAfterSetupError(err)
 		return nil, err
 	}
 	return c, nil
@@ -137,10 +142,27 @@ func NewClientStartTLSWithName(conn net.Conn, tlsConfig *tls.Config, localName s
 		return nil, err
 	}
 	if err := initStartTLS(c, tlsConfig); err != nil {
-		c.Close()
+		c.endAfterSetupError(err)
 		return nil, err
 	}
 	return c, nil
+}
+
+// ErrSTARTTLSUnsupported is returned by the STARTTLS constructors when the
+// server's EHLO reply does not offer STARTTLS.
+var ErrSTARTTLSUnsupported = errors.New("smtp: server doesn't support STARTTLS")
+
+// endAfterSetupError ends the session after a failed STARTTLS setup. While
+// the server is still listening (STARTTLS not offered, or EHLO or STARTTLS
+// refused with a reply other than 421) it says QUIT, so the server does not
+// log a dropped connection; otherwise it closes the connection.
+func (c *Client) endAfterSetupError(err error) {
+	var smtpErr *SMTPError
+	if errors.Is(err, ErrSTARTTLSUnsupported) || (errors.As(err, &smtpErr) && smtpErr.Code != 421) {
+		c.Quit()
+		return
+	}
+	c.Close()
 }
 
 func initStartTLS(c *Client, tlsConfig *tls.Config) error {
@@ -148,7 +170,7 @@ func initStartTLS(c *Client, tlsConfig *tls.Config) error {
 		return err
 	}
 	if ok, _ := c.Extension("STARTTLS"); !ok {
-		return errors.New("smtp: server doesn't support STARTTLS")
+		return ErrSTARTTLSUnsupported
 	}
 	if err := c.startTLS(tlsConfig); err != nil {
 		return err
@@ -210,7 +232,12 @@ func (c *Client) greet() error {
 	_, _, err := c.readResponse(220)
 	if err != nil {
 		c.greetError = err
-		c.text.Close()
+		// A server refusing the session with a 554 greeting stays connected
+		// waiting for QUIT (RFC 5321 section 3.1), so leave the connection
+		// to the caller's Quit or Close. Anything else ends it here.
+		if !quitAfterGreeting(err) {
+			c.text.Close()
+		}
 	}
 
 	return c.greetError
@@ -282,7 +309,12 @@ func (c *Client) readResponse(expectCode int) (int, string, error) {
 // cmd is a convenience function that sends a command and returns the response
 // textproto.Error returned by c.text.ReadResponse is converted into SMTPError.
 func (c *Client) cmd(expectCode int, format string, args ...interface{}) (int, string, error) {
-	c.conn.SetDeadline(time.Now().Add(c.CommandTimeout))
+	return c.cmdTimeout(c.CommandTimeout, expectCode, format, args...)
+}
+
+// cmdTimeout is cmd with its own deadline instead of CommandTimeout.
+func (c *Client) cmdTimeout(timeout time.Duration, expectCode int, format string, args ...interface{}) (int, string, error) {
+	c.conn.SetDeadline(time.Now().Add(timeout))
 	defer c.conn.SetDeadline(time.Time{})
 
 	id, err := c.text.Cmd(format, args...)
@@ -889,6 +921,11 @@ func (c *Client) MaxMessageSize() (size int, ok bool) {
 
 // Reset sends the RSET command to the server, aborting the current mail
 // transaction.
+//
+// The session stays greeted: RSET clears the mail transaction, not the
+// EHLO/HELO state (RFC 5321 section 4.1.1.5), so the commands that follow
+// (NOOP, MAIL, QUIT) are sent without a second EHLO, and Hello is refused as
+// after any other command.
 func (c *Client) Reset() error {
 	if err := c.hello(); err != nil {
 		return err
@@ -896,11 +933,6 @@ func (c *Client) Reset() error {
 	if _, _, err := c.cmd(250, "RSET"); err != nil {
 		return err
 	}
-
-	// allow custom HELLO again
-	c.didHello = false
-	c.helloError = nil
-
 	c.rcpts = nil
 	return nil
 }
@@ -917,17 +949,40 @@ func (c *Client) Noop() error {
 
 // Quit sends the QUIT command and closes the connection to the server.
 //
-// If Quit fails the connection is not closed, Close should be used
-// in this case.
+// The connection is always closed, also when QUIT is refused or its reply
+// does not arrive within QuitTimeout; the error returned is that failure, if
+// any. Quit never sends HELO/EHLO first: QUIT is valid at any point of a
+// session (RFC 5321 section 4.1.1.10). After a greeting that refused the
+// session with 554, QUIT is still sent, as RFC 5321 section 3.1 asks. A
+// session whose greeting was never read, or ended in 421 or without a reply,
+// is closed without writing anything, so Quit never waits for a greeting.
 func (c *Client) Quit() error {
-	if err := c.hello(); err != nil {
-		return err
+	if !c.didGreet || !quitAfterGreeting(c.greetError) {
+		return c.Close()
 	}
-	_, _, err := c.cmd(221, "QUIT")
+	timeout := c.QuitTimeout
+	if timeout <= 0 {
+		timeout = c.CommandTimeout
+	}
+	_, _, err := c.cmdTimeout(timeout, 221, "QUIT")
+	closeErr := c.Close()
 	if err != nil {
 		return err
 	}
-	return c.Close()
+	return closeErr
+}
+
+// quitAfterGreeting reports whether QUIT may be sent after a greeting that
+// ended with greetErr: always after a 220, and after any other reply except
+// 421 (RFC 5321 section 3.1 names 554 for refusing the session; 421 means the
+// server is closing the channel), but not after a greeting that failed
+// without a reply.
+func quitAfterGreeting(greetErr error) bool {
+	if greetErr == nil {
+		return true
+	}
+	var smtpErr *SMTPError
+	return errors.As(greetErr, &smtpErr) && smtpErr.Code != 421
 }
 
 func parseEnhancedCode(s string) (EnhancedCode, error) {
