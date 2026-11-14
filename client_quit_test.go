@@ -927,6 +927,8 @@ func TestQuitSkipsOutOfRangeAndDesyncReplies(t *testing.T) {
 		{name: "TLS 250 at DATA with stalled peer", reply: "250 out of sync\r\n", wantCode: 250, afterData: true},
 		{name: "TLS 600 at AUTH with stalled peer", reply: "600 broken proxy\r\n", wantCode: 600, afterAuth: true},
 		{name: "TLS 421 at AUTH with stalled peer", reply: "421 service shutting down\r\n", wantCode: 421, afterAuth: true},
+		{name: "TLS 250 at AUTH with stalled peer", reply: "250 not an AUTH reply\r\n", wantCode: 250, afterAuth: true},
+		{name: "TLS 300 at AUTH with stalled peer", reply: "300 unexpected intermediate\r\n", wantCode: 300, afterAuth: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clientSide, serverSide := net.Pipe()
@@ -1026,6 +1028,128 @@ func TestQuitSkipsOutOfRangeAndDesyncReplies(t *testing.T) {
 			case line := <-extraCmd:
 				t.Errorf("client sent unexpected follow-up command %q on broken/closing session", line)
 			default:
+			}
+		})
+	}
+}
+
+// The SASL cancel line "*" answers a pending 334 challenge. It is still
+// written after a 4xx/5xx refusal, but never onto a reply that leaves the
+// session desynchronized.
+func TestAuthAbortLine(t *testing.T) {
+	for name, tc := range map[string]struct {
+		server   string
+		wantCode int // 0: the SASL client fails, not the server
+		want     string
+	}{
+		"unexpected challenge is cancelled": {
+			server: "334 \n" + "501 cancelled\n" + "221 bye\n",
+			want:   "AUTH PLAIN AHVzZXIAcGFzcw==\n*\nQUIT\n",
+		},
+		"535 refusal": {
+			server:   "535 5.7.8 bad credentials\n" + "500 unrecognized\n" + "221 bye\n",
+			wantCode: 535,
+			want:     "AUTH PLAIN AHVzZXIAcGFzcw==\n*\nQUIT\n",
+		},
+		"250 is not an AUTH reply": {
+			server:   "250 ok\n" + "500 unrecognized\n" + "221 bye\n",
+			wantCode: 250,
+			want:     "AUTH PLAIN AHVzZXIAcGFzcw==\n",
+		},
+		"300 is not an AUTH reply": {
+			server:   "300 unexpected intermediate\n" + "501 cancelled\n" + "221 bye\n",
+			wantCode: 300,
+			want:     "AUTH PLAIN AHVzZXIAcGFzcw==\n",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			conn := newScriptedConn("220 hello\n" + "250-mx\n250 AUTH PLAIN\n" + tc.server)
+			c := NewClient(conn)
+			if err := c.Hello("sender.example"); err != nil {
+				t.Fatalf("Hello: %v", err)
+			}
+			err := c.Auth(sasl.NewPlainClient("", "user", "pass"))
+			var smtpErr *SMTPError
+			switch {
+			case err == nil:
+				t.Fatal("Auth succeeded")
+			case tc.wantCode == 0 && errors.As(err, &smtpErr):
+				t.Fatalf("Auth = %v; want the SASL client's own error", err)
+			case tc.wantCode != 0 && (!errors.As(err, &smtpErr) || smtpErr.Code != tc.wantCode):
+				t.Fatalf("Auth = %v; want SMTPError %d", err, tc.wantCode)
+			}
+			if err := c.Quit(); err != nil {
+				t.Errorf("Quit = %v; want nil", err)
+			}
+			if got, want := conn.commands(), "EHLO sender.example\n"+tc.want; got != want {
+				t.Errorf("client wrote:\n%s\nwant:\n%s", got, want)
+			}
+			if !conn.closed {
+				t.Error("Quit left the connection open")
+			}
+		})
+	}
+}
+
+// A desynchronized reply stays in force for the rest of the session: closing
+// a later DATA stream ends only the "QUIT would land in the message" state.
+func TestQuitStaysSkippedAfterDesyncThenData(t *testing.T) {
+	for name, tc := range map[string]struct {
+		lmtp   bool
+		server string
+		want   string
+	}{
+		"SMTP": {
+			server: "250 queued\n" + "221 bye\n",
+			want:   "EHLO sender.example\n",
+		},
+		"LMTP": {
+			lmtp:   true,
+			server: "250 delivered\n" + "221 bye\n",
+			want:   "LHLO sender.example\n",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			conn := newScriptedConn("220 hello\n" + "250 hello\n" + "250 sender ok\n" +
+				"354 not a RCPT reply\n" + // first RCPT
+				"250 rcpt ok\n" + // second RCPT
+				"354 go ahead\n" + tc.server)
+			c := NewClient(conn)
+			if tc.lmtp {
+				c = NewClientLMTP(conn)
+			}
+			if err := c.Hello("sender.example"); err != nil {
+				t.Fatalf("Hello: %v", err)
+			}
+			if err := c.Mail("sender@example.com", nil); err != nil {
+				t.Fatalf("Mail: %v", err)
+			}
+			var smtpErr *SMTPError
+			if err := c.Rcpt("first@example.com", nil); !errors.As(err, &smtpErr) || smtpErr.Code != 354 {
+				t.Fatalf("Rcpt = %v; want SMTPError 354", err)
+			}
+			if err := c.Rcpt("second@example.com", nil); err != nil {
+				t.Fatalf("Rcpt: %v", err)
+			}
+			w, err := c.Data()
+			if err != nil {
+				t.Fatalf("Data: %v", err)
+			}
+			if _, err := io.WriteString(w, "Subject: test\r\n\r\nhi\r\n"); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("w.Close: %v", err)
+			}
+			if err := c.Quit(); err != nil {
+				t.Errorf("Quit = %v; want nil", err)
+			}
+			want := tc.want + "MAIL FROM:<sender@example.com>\nRCPT TO:<first@example.com>\nRCPT TO:<second@example.com>\nDATA\nSubject: test\n\nhi\n.\n"
+			if got := conn.commands(); got != want {
+				t.Errorf("client wrote:\n%s\nwant:\n%s without QUIT", got, want)
+			}
+			if !conn.closed {
+				t.Error("Quit left the connection open")
 			}
 		})
 	}
