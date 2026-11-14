@@ -1071,6 +1071,15 @@ func (c *Client) abortClose() error {
 	past := time.Now().Add(-time.Second)
 	conn.SetDeadline(past)
 
+	tc, isTLS := conn.(*tls.Conn)
+	var rawErr error
+	if isTLS {
+		// Closing the underlying transport directly unblocks any in-flight TLS
+		// Read/Write at once and makes any concurrent or subsequent closeNotify
+		// write fail immediately, independent of scheduler timing.
+		rawErr = tc.NetConn().Close()
+	}
+
 	stop := make(chan struct{})
 	stopped := make(chan struct{})
 	timer := time.AfterFunc(time.Millisecond, func() {
@@ -1093,13 +1102,12 @@ func (c *Client) abortClose() error {
 	})
 
 	err := c.Close()
-	if errors.Is(err, net.ErrClosed) {
-		// Another goroutine got to close the connection first (Abort during a
-		// command whose caller then closes, or during Quit, which ends with a
-		// Close). It may still be inside crypto/tls's Close, which gives
-		// close_notify a fresh 5s write deadline over the expired one set
-		// above. Keep the expired deadline in place until the transport says
-		// it is closed, so that write fails at once as well.
+	if !isTLS && errors.Is(err, net.ErrClosed) {
+		// When a *tls.Conn is hidden behind a net.Conn decorator, another
+		// goroutine that got to Close first may still be inside crypto/tls's
+		// Close, which gives close_notify a fresh 5s write deadline over the
+		// expired one set above. Keep the expired deadline in place until the
+		// transport says it is closed, so that write fails at once as well.
 		handover := time.Now().Add(abortHandoverWait)
 		for conn.SetDeadline(past) == nil && time.Now().Before(handover) {
 			time.Sleep(time.Millisecond)
@@ -1110,6 +1118,9 @@ func (c *Client) abortClose() error {
 		<-stopped
 	}
 
+	if rawErr != nil && !errors.Is(rawErr, net.ErrClosed) {
+		return rawErr
+	}
 	if err == nil || errors.Is(err, net.ErrClosed) || isTLSCloseNotifyError(err) {
 		return nil
 	}
@@ -1150,7 +1161,12 @@ func (c *Client) Quit() error {
 		return c.abortClose()
 	}
 	_, _, err := c.cmdTimeout(time.Until(deadline), 221, "QUIT")
-	closeErr := c.Close()
+	var closeErr error
+	if quitAfterGreeting(err) {
+		closeErr = c.Close()
+	} else {
+		closeErr = c.abortClose()
+	}
 	if err != nil {
 		return err
 	}

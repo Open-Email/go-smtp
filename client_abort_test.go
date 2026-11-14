@@ -68,6 +68,10 @@ type ioTrackingConn struct {
 	// that lies in the past (Abort's) has been applied.
 	afterExpiredDeadline func()
 	expiredOnce          sync.Once
+	// beforeFutureWriteDeadline, if set, runs once before a future
+	// SetWriteDeadline (such as crypto/tls closeNotify's 5s deadline) is applied.
+	beforeFutureWriteDeadline func()
+	futureWriteOnce           sync.Once
 }
 
 func (c *ioTrackingConn) SetDeadline(d time.Time) error {
@@ -76,6 +80,13 @@ func (c *ioTrackingConn) SetDeadline(d time.Time) error {
 		c.expiredOnce.Do(c.afterExpiredDeadline)
 	}
 	return err
+}
+
+func (c *ioTrackingConn) SetWriteDeadline(d time.Time) error {
+	if c.beforeFutureWriteDeadline != nil && d.After(time.Now().Add(4*time.Second)) {
+		c.futureWriteOnce.Do(c.beforeFutureWriteDeadline)
+	}
+	return c.Conn.SetWriteDeadline(d)
 }
 
 func (c *ioTrackingConn) Read(b []byte) (int, error) {
@@ -204,6 +215,155 @@ func TestAbortDuringQuitOverStalledTLS(t *testing.T) {
 		t.Errorf("Abort and Quit took %v; a close waited for TLS close_notify", elapsed)
 	}
 	wantTransportClosed(t, serverSide)
+}
+
+func TestAbortRacesConcurrentCloseOverStalledTLS(t *testing.T) {
+	t.Run("direct tls.Conn closes underlying transport despite delayed closeNotify", func(t *testing.T) {
+		pipeSide, serverSide := net.Pipe()
+		defer pipeSide.Close()
+		// Hold Abort after its expired deadline wakes Mail so the caller's Close
+		// wins crypto/tls's activeCall CAS, then delay closeNotify's 5s
+		// SetWriteDeadline past abortHandoverWait to verify NetConn().Close()
+		// defeats any scheduler delay.
+		clientSide := &ioTrackingConn{
+			Conn:                      pipeSide,
+			afterExpiredDeadline:      func() { time.Sleep(30 * time.Millisecond) },
+			beforeFutureWriteDeadline: func() { time.Sleep(abortHandoverWait + 50*time.Millisecond) },
+		}
+		gotCommand := stalledTLSServer(t, serverSide)
+
+		c := NewClient(tls.Client(clientSide, &tls.Config{InsecureSkipVerify: true}))
+		c.CommandTimeout = time.Minute
+		if err := c.Hello("sender.example"); err != nil {
+			t.Fatalf("Hello: %v", err)
+		}
+		closeDone := make(chan struct{})
+		go func() {
+			defer close(closeDone)
+			_ = c.Mail("sender@example.com", nil)
+			_ = c.Close()
+		}()
+		<-gotCommand
+		clientSide.waitParkedInRead(t)
+
+		start := time.Now()
+		if err := c.Abort(); err != nil {
+			t.Errorf("Abort = %v; want nil", err)
+		}
+		wantTransportClosed(t, serverSide)
+		select {
+		case <-closeDone:
+		case <-time.After(abortBudget):
+			t.Fatalf("concurrent Close still blocked %v after Abort; waited for TLS close_notify", time.Since(start))
+		}
+	})
+
+	t.Run("wrapped tls.Conn hands over expired deadline", func(t *testing.T) {
+		pipeSide, serverSide := net.Pipe()
+		defer pipeSide.Close()
+		clientSide := &ioTrackingConn{Conn: pipeSide}
+		gotCommand := stalledTLSServer(t, serverSide)
+
+		tlsConn := tls.Client(clientSide, &tls.Config{InsecureSkipVerify: true})
+		wrapped := &ioTrackingConn{
+			Conn:                 tlsConn,
+			afterExpiredDeadline: func() { time.Sleep(30 * time.Millisecond) },
+		}
+		c := NewClient(wrapped)
+		c.CommandTimeout = time.Minute
+		if err := c.Hello("sender.example"); err != nil {
+			t.Fatalf("Hello: %v", err)
+		}
+		closeDone := make(chan struct{})
+		go func() {
+			defer close(closeDone)
+			_ = c.Mail("sender@example.com", nil)
+			_ = c.Close()
+		}()
+		<-gotCommand
+		clientSide.waitParkedInRead(t)
+
+		start := time.Now()
+		if err := c.Abort(); err != nil {
+			t.Errorf("Abort = %v; want nil", err)
+		}
+		select {
+		case <-closeDone:
+		case <-time.After(abortBudget):
+			t.Fatalf("concurrent Close on wrapped tls.Conn still blocked %v after Abort", time.Since(start))
+		}
+		wantTransportClosed(t, serverSide)
+	})
+}
+
+func TestQuitBrokenReplyOverStalledTLSAbortsCloseNotify(t *testing.T) {
+	cert, err := tls.X509KeyPair(localhostCert, localhostKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		reply    string
+		wantCode int
+	}{
+		{name: "421 on QUIT", reply: "421 shutting down\r\n", wantCode: 421},
+		{name: "out-of-range 600 on QUIT", reply: "600 broken proxy\r\n", wantCode: 600},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clientSide, serverSide := net.Pipe()
+			defer clientSide.Close()
+			release := make(chan struct{})
+			serverDone := make(chan error, 1)
+			t.Cleanup(func() {
+				close(release)
+				serverSide.Close()
+				if err := <-serverDone; err != nil {
+					t.Errorf("stalled TLS server: %v", err)
+				}
+			})
+			go func() {
+				serverDone <- func() error {
+					s := tls.Server(serverSide, &tls.Config{Certificates: []tls.Certificate{cert}})
+					r := bufio.NewReader(s)
+					if _, err := s.Write([]byte("220 hello\r\n")); err != nil {
+						return err
+					}
+					if _, err := r.ReadString('\n'); err != nil { // EHLO
+						return err
+					}
+					if _, err := s.Write([]byte("250 hello\r\n")); err != nil {
+						return err
+					}
+					if _, err := r.ReadString('\n'); err != nil { // QUIT
+						return err
+					}
+					if _, err := s.Write([]byte(tc.reply)); err != nil {
+						return err
+					}
+					<-release
+					return nil
+				}()
+			}()
+
+			c := NewClient(tls.Client(clientSide, &tls.Config{InsecureSkipVerify: true}))
+			c.CommandTimeout = time.Minute
+			c.QuitTimeout = time.Minute
+			if err := c.Hello("sender.example"); err != nil {
+				t.Fatalf("Hello: %v", err)
+			}
+
+			start := time.Now()
+			err := c.Quit()
+			var smtpErr *SMTPError
+			if !errors.As(err, &smtpErr) || smtpErr.Code != tc.wantCode {
+				t.Fatalf("Quit = %v; want SMTPError %d", err, tc.wantCode)
+			}
+			if elapsed := time.Since(start); elapsed > abortBudget {
+				t.Errorf("Quit took %v after %d reply; waited for TLS close_notify", elapsed, tc.wantCode)
+			}
+			wantTransportClosed(t, serverSide)
+		})
+	}
 }
 
 func TestAbortPlaintextSendsNothing(t *testing.T) {
