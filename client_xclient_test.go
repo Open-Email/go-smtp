@@ -15,15 +15,12 @@ func TestClientXCLIENT(t *testing.T) {
 		"250 PIPELINING\n" +
 		// Response to XCLIENT is a new greeting
 		"220 new greeting\n" +
-		// Response to second EHLO
-		"250-mx.google.com at your service\n" +
-		"250 PIPELINING\n" +
 		// Response to QUIT
 		"221 goodbye"
 
+	// After XCLIENT the session is reset, but QUIT needs no new EHLO.
 	xclientClient := "EHLO localhost\n" +
 		"XCLIENT ADDR=192.168.1.100 PROTO=ESMTP\n" +
-		"EHLO localhost\n" + // After XCLIENT, session is reset, must say EHLO again
 		"QUIT"
 
 	server := strings.Join(strings.Split(xclientServer, "\n"), "\r\n")
@@ -60,7 +57,7 @@ func TestClientXCLIENT(t *testing.T) {
 		t.Fatalf("XCLIENT failed: %v", err)
 	}
 
-	// Quit will trigger a new EHLO because the session was reset
+	// Quit sends QUIT alone, although XCLIENT reset the session
 	if err := c.Quit(); err != nil {
 		t.Fatalf("Quit failed: %v", err)
 	}
