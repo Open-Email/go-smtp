@@ -43,8 +43,8 @@ type Client struct {
 	// Time to wait for responses after final dot.
 	SubmissionTimeout time.Duration
 	// Time allowed for Quit, including an unread greeting, the QUIT reply,
-	// and connection cleanup. NewClient sets this to 10s; zero or negative
-	// means CommandTimeout.
+	// and connection cleanup. Zero or negative uses CommandTimeout capped
+	// at 10s.
 	QuitTimeout time.Duration
 
 	// Logger for all network activity.
@@ -116,7 +116,6 @@ func NewClient(conn net.Conn) *Client {
 		// 10 minutes + 2 minute buffer in case the server is doing transparent
 		// forwarding and also follows recommended timeouts.
 		SubmissionTimeout: 12 * time.Minute,
-		QuitTimeout:       10 * time.Second,
 	}
 
 	c.setConn(conn)
@@ -154,11 +153,15 @@ func NewClientStartTLSWithName(conn net.Conn, tlsConfig *tls.Config, localName s
 // server's EHLO reply does not offer STARTTLS.
 var ErrSTARTTLSUnsupported = errors.New("smtp: server doesn't support STARTTLS")
 
+// defaultQuitTimeout caps Quit when QuitTimeout is not set explicitly and
+// CommandTimeout is larger.
+const defaultQuitTimeout = 10 * time.Second
+
 // setupQuitTimeout bounds the cleanup QUIT sent when DialStartTLS or
 // NewClientStartTLS* fails after receiving an SMTP reply. The connection is
 // already established and at a command boundary, so a responsive peer answers
 // within one round trip; a peer that ignores QUIT must not stall setup failure
-// or plaintext fallback for the full 10s QuitTimeout.
+// or plaintext fallback for the full 10s default Quit budget.
 const setupQuitTimeout = time.Second
 
 // endAfterSetupError ends the session after a failed STARTTLS setup. While
@@ -168,13 +171,13 @@ const setupQuitTimeout = time.Second
 func (c *Client) endAfterSetupError(err error) {
 	var smtpErr *SMTPError
 	if errors.Is(err, ErrSTARTTLSUnsupported) || (errors.As(err, &smtpErr) && smtpErr.Code != 421) {
-		if c.QuitTimeout <= 0 || c.QuitTimeout > setupQuitTimeout {
+		if t := c.quitTimeout(); t <= 0 || t > setupQuitTimeout {
 			c.QuitTimeout = setupQuitTimeout
 		}
 		c.Quit()
 		return
 	}
-	c.Close()
+	c.abortClose()
 }
 
 func initStartTLS(c *Client, tlsConfig *tls.Config) error {
@@ -252,7 +255,7 @@ func (c *Client) greetTimeout(timeout time.Duration) error {
 		// section 3.1 names 554) stays connected waiting for QUIT, so leave the
 		// connection to the caller's Quit or Close. Anything else ends it here.
 		if !quitAfterGreeting(err) {
-			c.text.Close()
+			c.abortClose()
 		}
 	}
 
@@ -972,28 +975,20 @@ func (c *Client) Noop() error {
 	return err
 }
 
-// Quit sends the QUIT command and closes the connection to the server.
-//
-// The connection is always closed, also when QUIT is refused or its reply
-// does not arrive within QuitTimeout; the error returned is that failure, if
-// any. Quit never sends HELO/EHLO first: QUIT is valid at any point of a
-// session (RFC 5321 section 4.1.1.10). After a greeting that refused the
-// session with 554, QUIT is still sent, as RFC 5321 section 3.1 asks.
-// If the greeting has not been read, Quit reads it within the same timeout.
-// After a 421 reply to any command, a broken or timed-out command, an unclosed
-// DATA stream, or a greeting that failed without a complete SMTP reply, the
-// connection is closed without sending QUIT.
-func (c *Client) Quit() error {
-	timeout := c.QuitTimeout
-	if timeout <= 0 {
-		timeout = c.CommandTimeout
+func (c *Client) quitTimeout() time.Duration {
+	if c.QuitTimeout > 0 {
+		return c.QuitTimeout
 	}
-	deadline := time.Now().Add(timeout)
+	if c.CommandTimeout > defaultQuitTimeout {
+		return defaultQuitTimeout
+	}
+	return c.CommandTimeout
+}
 
-	// TLS Close installs its own write deadline, even when hidden behind a
-	// net.Conn wrapper. Keep enforcing our deadline until Close finishes so
-	// TLS cleanup cannot extend the budget or leave the transport open.
-	conn := c.conn
+// enforceDeadline keeps applying deadline to conn once it expires so an inner
+// tls.Conn Close (even hidden behind a net.Conn decorator) cannot extend the
+// wait with its own write deadline.
+func enforceDeadline(conn net.Conn, deadline time.Time) func() {
 	stop := make(chan struct{})
 	stopped := make(chan struct{})
 	timer := time.AfterFunc(time.Until(deadline), func() {
@@ -1014,26 +1009,86 @@ func (c *Client) Quit() error {
 			}
 		}
 	})
-	defer func() {
+	return func() {
 		close(stop)
 		if !timer.Stop() {
 			<-stopped
 		}
-	}()
+	}
+}
+
+// abortClose closes the connection without waiting to flush a TLS close_notify
+// alert onto an already-closing (421) or broken stream.
+func (c *Client) abortClose() error {
+	conn := c.conn
+	past := time.Now().Add(-time.Second)
+	conn.SetDeadline(past)
+
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	timer := time.AfterFunc(time.Millisecond, func() {
+		defer close(stopped)
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			conn.SetDeadline(past)
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
+		}
+	})
+
+	err := c.Close()
+	close(stop)
+	if !timer.Stop() {
+		<-stopped
+	}
+
+	if err == nil || errors.Is(err, net.ErrClosed) || isTLSCloseNotifyError(err) {
+		return nil
+	}
+	return err
+}
+
+func isTLSCloseNotifyError(err error) bool {
+	// crypto/tls Conn.Close returns this alert error only after its underlying
+	// net.Conn.Close() succeeded.
+	return err != nil && strings.Contains(err.Error(), "tls: failed to send closeNotify alert (but connection was closed anyway)")
+}
+
+// Quit sends the QUIT command and closes the connection to the server.
+//
+// The connection is always closed, also when QUIT is refused or its reply
+// does not arrive within QuitTimeout; the error returned is that failure, if
+// any. Quit never sends HELO/EHLO first: QUIT is valid at any point of a
+// session (RFC 5321 section 4.1.1.10). After a greeting that refused the
+// session with 554, QUIT is still sent, as RFC 5321 section 3.1 asks.
+// If the greeting has not been read, Quit reads it within the same timeout.
+// After a 421 reply to any command, a broken or timed-out command, an unclosed
+// DATA stream, or a greeting that failed without a complete SMTP reply, the
+// connection is closed without sending QUIT.
+func (c *Client) Quit() error {
+	deadline := time.Now().Add(c.quitTimeout())
+	stopDeadline := enforceDeadline(c.conn, deadline)
+	defer stopDeadline()
 
 	alreadyGreeted := c.didGreet
 	if err := c.greetTimeout(time.Until(deadline)); !quitAfterGreeting(err) {
-		closeErr := c.Close()
+		closeErr := c.abortClose()
 		if !alreadyGreeted {
 			return err
-		}
-		if errors.Is(closeErr, net.ErrClosed) {
-			return nil
 		}
 		return closeErr
 	}
 	if c.cannotQuit {
-		return c.Close()
+		return c.abortClose()
 	}
 	_, _, err := c.cmdTimeout(time.Until(deadline), 221, "QUIT")
 	closeErr := c.Close()

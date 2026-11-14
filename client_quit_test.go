@@ -664,3 +664,169 @@ func TestStartTLSSetupFailureBoundsIgnoredQuit(t *testing.T) {
 		t.Fatal("NewClientStartTLSWithName returned without closing the transport")
 	}
 }
+
+func TestQuitAfter421OrTimeoutOverTLS(t *testing.T) {
+	cert, err := tls.X509KeyPair(localhostCert, localhostKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, wrapped := range []bool{false, true} {
+		namePrefix := "direct"
+		if wrapped {
+			namePrefix = "wrapped"
+		}
+
+		t.Run(namePrefix+"/421 closed by peer", func(t *testing.T) {
+			clientSide, serverSide := net.Pipe()
+			defer clientSide.Close()
+			defer serverSide.Close()
+			serverDone := make(chan error, 1)
+			go func() {
+				s := tls.Server(serverSide, &tls.Config{Certificates: []tls.Certificate{cert}})
+				r := bufio.NewReader(s)
+				if _, err := io.WriteString(s, "220 hello\r\n"); err != nil {
+					serverDone <- err
+					return
+				}
+				if _, err := r.ReadString('\n'); err != nil {
+					serverDone <- err
+					return
+				}
+				if _, err := io.WriteString(s, "250 hello\r\n"); err != nil {
+					serverDone <- err
+					return
+				}
+				if _, err := r.ReadString('\n'); err != nil {
+					serverDone <- err
+					return
+				}
+				if _, err := io.WriteString(s, "421 4.3.2 service shutting down\r\n"); err != nil {
+					serverDone <- err
+					return
+				}
+				_ = serverSide.Close()
+				serverDone <- nil
+			}()
+
+			var conn net.Conn = tls.Client(clientSide, &tls.Config{InsecureSkipVerify: true})
+			if wrapped {
+				conn = &quitTLSDecorator{Conn: conn}
+			}
+			c := NewClient(conn)
+			if err := c.Hello("sender.example"); err != nil {
+				t.Fatalf("Hello: %v", err)
+			}
+			err := c.Mail("sender@example.com", nil)
+			var smtpErr *SMTPError
+			if !errors.As(err, &smtpErr) || smtpErr.Code != 421 {
+				t.Fatalf("Mail = %v; want 421", err)
+			}
+			if err := <-serverDone; err != nil {
+				t.Fatalf("server script: %v", err)
+			}
+			if err := c.Quit(); err != nil {
+				t.Errorf("Quit after TLS 421 = %v; want nil", err)
+			}
+		})
+
+		t.Run(namePrefix+"/command timeout with stalled peer", func(t *testing.T) {
+			clientSide, serverSide := net.Pipe()
+			defer clientSide.Close()
+			defer serverSide.Close()
+			release := make(chan struct{})
+			defer close(release)
+			mailSeen := make(chan error, 1)
+			go func() {
+				s := tls.Server(serverSide, &tls.Config{Certificates: []tls.Certificate{cert}})
+				r := bufio.NewReader(s)
+				if _, err := io.WriteString(s, "220 hello\r\n"); err != nil {
+					mailSeen <- err
+					return
+				}
+				if _, err := r.ReadString('\n'); err != nil {
+					mailSeen <- err
+					return
+				}
+				if _, err := io.WriteString(s, "250 hello\r\n"); err != nil {
+					mailSeen <- err
+					return
+				}
+				if _, err := r.ReadString('\n'); err != nil {
+					mailSeen <- err
+					return
+				}
+				mailSeen <- nil
+				<-release
+			}()
+
+			var conn net.Conn = tls.Client(clientSide, &tls.Config{InsecureSkipVerify: true})
+			if wrapped {
+				conn = &quitTLSDecorator{Conn: conn}
+			}
+			c := NewClient(conn)
+			c.CommandTimeout = 40 * time.Millisecond
+			c.QuitTimeout = 2 * time.Second
+			if err := c.Hello("sender.example"); err != nil {
+				t.Fatalf("Hello: %v", err)
+			}
+			if err := c.Mail("sender@example.com", nil); err == nil {
+				t.Fatal("Mail succeeded without a reply")
+			}
+			if err := <-mailSeen; err != nil {
+				t.Fatalf("server script: %v", err)
+			}
+			start := time.Now()
+			if err := c.Quit(); err != nil {
+				t.Errorf("Quit after TLS command timeout = %v; want nil", err)
+			}
+			if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+				t.Errorf("Quit waited %v after TLS command timeout; want immediate abort", elapsed)
+			}
+			serverSide.SetReadDeadline(time.Now().Add(time.Second))
+			if _, err := serverSide.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+				t.Errorf("peer Read = %v; want EOF after Quit closed the transport", err)
+			}
+		})
+	}
+}
+
+func TestQuitFollowsLoweredCommandTimeout(t *testing.T) {
+	if got := NewClient(newScriptedConn("")).quitTimeout(); got != 10*time.Second {
+		t.Fatalf("default quitTimeout = %v; want 10s", got)
+	}
+	cExplicit := NewClient(newScriptedConn(""))
+	cExplicit.CommandTimeout = 40 * time.Millisecond
+	cExplicit.QuitTimeout = 200 * time.Millisecond
+	if got := cExplicit.quitTimeout(); got != 200*time.Millisecond {
+		t.Fatalf("explicit quitTimeout = %v; want 200ms", got)
+	}
+
+	clientSide, serverSide := net.Pipe()
+	defer clientSide.Close()
+	defer serverSide.Close()
+	go func() {
+		r := bufio.NewReader(serverSide)
+		_, _ = io.WriteString(serverSide, "220 hello\r\n")
+		_, _ = r.ReadString('\n') // EHLO
+		_, _ = io.WriteString(serverSide, "250 mx at your service\r\n")
+		_, _ = io.Copy(io.Discard, r) // never answers QUIT
+	}()
+
+	c := NewClient(clientSide)
+	c.CommandTimeout = 50 * time.Millisecond
+	if err := c.Hello("r5.out.example"); err != nil {
+		t.Fatalf("Hello: %v", err)
+	}
+	start := time.Now()
+	if err := c.Quit(); err == nil {
+		t.Error("Quit returned nil for an unanswered QUIT")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Quit waited %v when CommandTimeout was lowered to %v", elapsed, c.CommandTimeout)
+	}
+	serverSide.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := serverSide.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Errorf("peer Read = %v; want EOF after Quit timed out", err)
+	}
+}
