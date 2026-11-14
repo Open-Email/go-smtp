@@ -36,13 +36,14 @@ type Client struct {
 	helloError error             // the error from the hello
 	rcpts      []string          // recipients accumulated for the current session
 
+	serverClosing bool // whether the server has sent a 421 reply
+
 	// Time to wait for command responses (this includes 3xx reply to DATA).
 	CommandTimeout time.Duration
 	// Time to wait for responses after final dot.
 	SubmissionTimeout time.Duration
-	// Time to wait for the reply to QUIT. Zero means CommandTimeout. Quit
-	// closes the connection when it runs out, so a server that never answers
-	// QUIT holds the connection for this long at most.
+	// Time allowed for Quit, including an unread greeting, the QUIT reply,
+	// and connection cleanup. Zero means CommandTimeout.
 	QuitTimeout time.Duration
 
 	// Logger for all network activity.
@@ -220,12 +221,16 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) greet() error {
+	return c.greetTimeout(c.CommandTimeout)
+}
+
+func (c *Client) greetTimeout(timeout time.Duration) error {
 	if c.didGreet {
 		return c.greetError
 	}
 
 	// Initial greeting timeout. RFC 5321 recommends 5 minutes.
-	c.conn.SetDeadline(time.Now().Add(c.CommandTimeout))
+	c.conn.SetDeadline(time.Now().Add(timeout))
 	defer c.conn.SetDeadline(time.Time{})
 
 	c.didGreet = true
@@ -300,6 +305,9 @@ func (c *Client) SetLocalName(localName string) error {
 
 func (c *Client) readResponse(expectCode int) (int, string, error) {
 	code, msg, err := c.text.ReadResponse(expectCode)
+	if code == 421 {
+		c.serverClosing = true
+	}
 	if protoErr, ok := err.(*textproto.Error); ok {
 		err = toSMTPErr(protoErr)
 	}
@@ -953,18 +961,56 @@ func (c *Client) Noop() error {
 // does not arrive within QuitTimeout; the error returned is that failure, if
 // any. Quit never sends HELO/EHLO first: QUIT is valid at any point of a
 // session (RFC 5321 section 4.1.1.10). After a greeting that refused the
-// session with 554, QUIT is still sent, as RFC 5321 section 3.1 asks. A
-// session whose greeting was never read, or ended in 421 or without a reply,
-// is closed without writing anything, so Quit never waits for a greeting.
+// session with 554, QUIT is still sent, as RFC 5321 section 3.1 asks.
+// If the greeting has not been read, Quit reads it within the same timeout.
+// After a 421 reply to any command, or a greeting that failed without a
+// complete SMTP reply, the connection is closed without sending QUIT.
 func (c *Client) Quit() error {
-	if !c.didGreet || !quitAfterGreeting(c.greetError) {
-		return c.Close()
-	}
 	timeout := c.QuitTimeout
 	if timeout <= 0 {
 		timeout = c.CommandTimeout
 	}
-	_, _, err := c.cmdTimeout(timeout, 221, "QUIT")
+	deadline := time.Now().Add(timeout)
+
+	// TLS Close installs its own write deadline, even when hidden behind a
+	// net.Conn wrapper. Keep enforcing our deadline until Close finishes so
+	// TLS cleanup cannot extend the budget or leave the transport open.
+	conn := c.conn
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	timer := time.AfterFunc(time.Until(deadline), func() {
+		defer close(stopped)
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			conn.SetDeadline(deadline)
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
+		}
+	})
+	defer func() {
+		close(stop)
+		if !timer.Stop() {
+			<-stopped
+		}
+	}()
+
+	if err := c.greetTimeout(time.Until(deadline)); !quitAfterGreeting(err) {
+		c.Close()
+		return err
+	}
+	if c.serverClosing {
+		return c.Close()
+	}
+	_, _, err := c.cmdTimeout(time.Until(deadline), 221, "QUIT")
 	closeErr := c.Close()
 	if err != nil {
 		return err
