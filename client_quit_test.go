@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/emersion/go-sasl"
 )
 
 // scriptedConn replays a fixed server script, records what the client wrote
@@ -590,6 +592,30 @@ func TestStartTLSSetupFailureEndsWithQuit(t *testing.T) {
 			server: "554 5.7.1 your IP is listed\n" + "221 bye\n",
 			want:   "QUIT\n",
 		},
+		"600 greeting": {
+			server: "600 broken proxy\n" + "221 bye\n",
+			want:   "",
+		},
+		"300 greeting": {
+			server: "300 unexpected intermediate\n" + "221 bye\n",
+			want:   "",
+		},
+		"EHLO answered with 600": {
+			server: "220 hello\n" + "600 broken proxy\n" + "221 bye\n",
+			want:   "EHLO r5.out.example\n",
+		},
+		"EHLO answered with 300": {
+			server: "220 hello\n" + "300 unexpected intermediate\n" + "221 bye\n",
+			want:   "EHLO r5.out.example\n",
+		},
+		"STARTTLS answered with 600": {
+			server: "220 hello\n" + "250-mx\n250 STARTTLS\n" + "600 broken proxy\n" + "221 bye\n",
+			want:   "EHLO r5.out.example\nSTARTTLS\n",
+		},
+		"STARTTLS answered with 250": {
+			server: "220 hello\n" + "250-mx\n250 STARTTLS\n" + "250 not 220\n" + "221 bye\n",
+			want:   "EHLO r5.out.example\nSTARTTLS\n",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			conn := newScriptedConn(tc.server)
@@ -828,5 +854,179 @@ func TestQuitFollowsLoweredCommandTimeout(t *testing.T) {
 	serverSide.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := serverSide.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Errorf("peer Read = %v; want EOF after Quit timed out", err)
+	}
+}
+
+func TestQuitSkipsOutOfRangeAndDesyncReplies(t *testing.T) {
+	t.Run("600 greeting", func(t *testing.T) {
+		conn := newScriptedConn("600 broken proxy\n221 bye\n")
+		c := NewClient(conn)
+		err := c.Quit()
+		var smtpErr *SMTPError
+		if !errors.As(err, &smtpErr) || smtpErr.Code != 600 {
+			t.Fatalf("Quit = %v; want SMTPError 600", err)
+		}
+		if got := conn.commands(); got != "" {
+			t.Errorf("client wrote %q after 600 greeting; want nothing", got)
+		}
+		if !conn.closed {
+			t.Error("connection left open after 600 greeting")
+		}
+	})
+
+	t.Run("300 greeting", func(t *testing.T) {
+		conn := newScriptedConn("300 unexpected intermediate\n221 bye\n")
+		c := NewClient(conn)
+		err := c.Quit()
+		var smtpErr *SMTPError
+		if !errors.As(err, &smtpErr) || smtpErr.Code != 300 {
+			t.Fatalf("Quit = %v; want SMTPError 300", err)
+		}
+		if got := conn.commands(); got != "" {
+			t.Errorf("client wrote %q after 300 greeting; want nothing", got)
+		}
+		if !conn.closed {
+			t.Error("connection left open after 300 greeting")
+		}
+	})
+
+	t.Run("VRFY 252 keeps session usable for QUIT", func(t *testing.T) {
+		conn := newScriptedConn("220 hello\n250 mx\n252 cannot verify\n221 bye\n")
+		c := NewClient(conn)
+		if err := c.Hello("sender.example"); err != nil {
+			t.Fatalf("Hello: %v", err)
+		}
+		err := c.Verify("user@example.com")
+		var smtpErr *SMTPError
+		if !errors.As(err, &smtpErr) || smtpErr.Code != 252 {
+			t.Fatalf("Verify = %v; want SMTPError 252", err)
+		}
+		if err := c.Quit(); err != nil {
+			t.Fatalf("Quit after 252 = %v; want nil", err)
+		}
+		if got, want := conn.commands(), "EHLO sender.example\nVRFY user@example.com\nQUIT\n"; got != want {
+			t.Errorf("client wrote:\n%s\nwant:\n%s", got, want)
+		}
+	})
+
+	cert, err := tls.X509KeyPair(localhostCert, localhostKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		reply     string
+		wantCode  int
+		afterMail bool
+		afterData bool
+		afterAuth bool
+	}{
+		{name: "TLS 600 at MAIL with stalled peer", reply: "600 broken proxy\r\n", wantCode: 600, afterMail: true},
+		{name: "TLS 354 at MAIL with stalled peer", reply: "354 desynchronized\r\n", wantCode: 354, afterMail: true},
+		{name: "TLS 250 at DATA with stalled peer", reply: "250 out of sync\r\n", wantCode: 250, afterData: true},
+		{name: "TLS 600 at AUTH with stalled peer", reply: "600 broken proxy\r\n", wantCode: 600, afterAuth: true},
+		{name: "TLS 421 at AUTH with stalled peer", reply: "421 service shutting down\r\n", wantCode: 421, afterAuth: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clientSide, serverSide := net.Pipe()
+			defer clientSide.Close()
+			defer serverSide.Close()
+			release := make(chan struct{})
+			defer close(release)
+			extraCmd := make(chan string, 1)
+			ready := make(chan error, 1)
+
+			go func() {
+				s := tls.Server(serverSide, &tls.Config{Certificates: []tls.Certificate{cert}})
+				r := bufio.NewReader(s)
+				if _, err := io.WriteString(s, "220 hello\r\n"); err != nil {
+					ready <- err
+					return
+				}
+				if _, err := r.ReadString('\n'); err != nil {
+					ready <- err
+					return
+				}
+				if _, err := io.WriteString(s, "250-hello\r\n250 AUTH PLAIN\r\n"); err != nil {
+					ready <- err
+					return
+				}
+				if tc.afterData {
+					for i := 0; i < 2; i++ { // MAIL, RCPT
+						if _, err := r.ReadString('\n'); err != nil {
+							ready <- err
+							return
+						}
+						if _, err := io.WriteString(s, "250 ok\r\n"); err != nil {
+							ready <- err
+							return
+						}
+					}
+				}
+				if _, err := r.ReadString('\n'); err != nil {
+					ready <- err
+					return
+				}
+				if _, err := io.WriteString(s, tc.reply); err != nil {
+					ready <- err
+					return
+				}
+				ready <- nil
+				// Stop reading until the client closes or erroneously writes another command;
+				// wait on release if nothing arrives.
+				doneRead := make(chan struct{})
+				go func() {
+					defer close(doneRead)
+					if line, err := r.ReadString('\n'); err == nil {
+						extraCmd <- line
+					}
+				}()
+				<-release
+				<-doneRead
+			}()
+
+			c := NewClient(tls.Client(clientSide, &tls.Config{InsecureSkipVerify: true}))
+			c.CommandTimeout = 400 * time.Millisecond
+			c.QuitTimeout = 2 * time.Second
+			if err := c.Hello("sender.example"); err != nil {
+				t.Fatalf("Hello: %v", err)
+			}
+
+			start := time.Now()
+			var opErr error
+			switch {
+			case tc.afterMail:
+				opErr = c.Mail("sender@example.com", nil)
+			case tc.afterData:
+				if err := c.Mail("sender@example.com", nil); err != nil {
+					t.Fatalf("Mail: %v", err)
+				}
+				if err := c.Rcpt("rcpt@example.com", nil); err != nil {
+					t.Fatalf("Rcpt: %v", err)
+				}
+				_, opErr = c.Data()
+			case tc.afterAuth:
+				opErr = c.Auth(sasl.NewPlainClient("", "user", "pass"))
+			}
+			var smtpErr *SMTPError
+			if !errors.As(opErr, &smtpErr) || smtpErr.Code != tc.wantCode {
+				t.Fatalf("opErr = %v; want SMTPError %d", opErr, tc.wantCode)
+			}
+			if err := <-ready; err != nil {
+				t.Fatalf("server script: %v", err)
+			}
+			if err := c.Quit(); err != nil {
+				t.Errorf("Quit = %v; want nil", err)
+			}
+			if elapsed := time.Since(start); elapsed > 350*time.Millisecond {
+				t.Errorf("command + Quit took %v; want immediate abort without waiting for command/quit/TLS timeout", elapsed)
+			}
+			select {
+			case line := <-extraCmd:
+				t.Errorf("client sent unexpected follow-up command %q on broken/closing session", line)
+			default:
+			}
+		})
 	}
 }

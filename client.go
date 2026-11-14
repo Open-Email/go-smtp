@@ -164,13 +164,20 @@ const defaultQuitTimeout = 10 * time.Second
 // or plaintext fallback for the full 10s default Quit budget.
 const setupQuitTimeout = time.Second
 
+// canQuitAfterErrorCode reports whether code is a 4xx/5xx SMTP negative
+// completion reply that leaves the server listening at a command boundary
+// (any 4xx/5xx other than 421, which announces channel closure).
+func canQuitAfterErrorCode(code int) bool {
+	return code >= 400 && code < 600 && code != 421
+}
+
 // endAfterSetupError ends the session after a failed STARTTLS setup. While
 // the server is still listening (STARTTLS not offered, or greeting, EHLO, or
-// STARTTLS refused with a reply other than 421) it says QUIT, so the server
-// does not log a dropped connection; otherwise it closes the connection.
+// STARTTLS refused with a 4xx/5xx reply other than 421) it says QUIT, so the
+// server does not log a dropped connection; otherwise it closes the connection.
 func (c *Client) endAfterSetupError(err error) {
 	var smtpErr *SMTPError
-	if errors.Is(err, ErrSTARTTLSUnsupported) || (errors.As(err, &smtpErr) && smtpErr.Code != 421) {
+	if errors.Is(err, ErrSTARTTLSUnsupported) || (errors.As(err, &smtpErr) && canQuitAfterErrorCode(smtpErr.Code)) {
 		if t := c.quitTimeout(); t <= 0 || t > setupQuitTimeout {
 			c.QuitTimeout = setupQuitTimeout
 		}
@@ -319,10 +326,17 @@ func (c *Client) SetLocalName(localName string) error {
 
 func (c *Client) readResponse(expectCode int) (int, string, error) {
 	code, msg, err := c.text.ReadResponse(expectCode)
-	if code == 421 {
+	if code == 221 || code == 421 || code < 200 || code >= 600 {
 		c.cannotQuit = true
 	}
 	if protoErr, ok := err.(*textproto.Error); ok {
+		// Standard 4xx/5xx refusals (except 421) and 25x completion replies to
+		// commands expecting 250 (such as VRFY returning 251/252) leave the
+		// session synchronized at a command boundary; out-of-range or
+		// unexpected 2xx/3xx replies do not.
+		if !canQuitAfterErrorCode(protoErr.Code) && !(expectCode == 250 && protoErr.Code/10 == 25) {
+			c.cannotQuit = true
+		}
 		err = toSMTPErr(protoErr)
 	} else if err != nil {
 		c.cannotQuit = true
@@ -470,6 +484,7 @@ func (c *Client) Auth(a sasl.Client) error {
 	code, msg64, err := c.cmd(0, "%s", strings.TrimSpace(fmt.Sprintf("AUTH %s %s", mech, resp64)))
 	for err == nil {
 		var msg []byte
+		unclean := false
 		switch code {
 		case 334:
 			msg, err = encoding.DecodeString(msg64)
@@ -477,6 +492,7 @@ func (c *Client) Auth(a sasl.Client) error {
 			// the last message isn't base64 because it isn't a challenge
 			msg = []byte(msg64)
 		default:
+			unclean = !canQuitAfterErrorCode(code)
 			err = toSMTPErr(&textproto.Error{Code: code, Msg: msg64})
 		}
 		if err == nil {
@@ -487,8 +503,13 @@ func (c *Client) Auth(a sasl.Client) error {
 			}
 		}
 		if err != nil {
-			// abort the AUTH
-			c.cmd(501, "*")
+			if !c.cannotQuit {
+				// abort the AUTH
+				c.cmd(501, "*")
+			}
+			if unclean {
+				c.cannotQuit = true
+			}
 			break
 		}
 		if resp == nil {
@@ -1071,9 +1092,9 @@ func isTLSCloseNotifyError(err error) bool {
 // session (RFC 5321 section 4.1.1.10). After a greeting that refused the
 // session with 554, QUIT is still sent, as RFC 5321 section 3.1 asks.
 // If the greeting has not been read, Quit reads it within the same timeout.
-// After a 421 reply to any command, a broken or timed-out command, an unclosed
-// DATA stream, or a greeting that failed without a complete SMTP reply, the
-// connection is closed without sending QUIT.
+// After a 421 reply, an out-of-range or desynchronized reply, a broken or
+// timed-out command, an unclosed DATA stream, or a greeting that failed
+// without a 4xx/5xx refusal, the connection is closed without sending QUIT.
 func (c *Client) Quit() error {
 	deadline := time.Now().Add(c.quitTimeout())
 	stopDeadline := enforceDeadline(c.conn, deadline)
@@ -1099,16 +1120,16 @@ func (c *Client) Quit() error {
 }
 
 // quitAfterGreeting reports whether QUIT may be sent after a greeting that
-// ended with greetErr: always after a 220, and after any other reply except
-// 421 (RFC 5321 section 3.1 names 554 for refusing the session; 421 means the
-// server is closing the channel), but not after a greeting that failed
-// without a reply.
+// ended with greetErr: always after a 220, and after a 4xx/5xx refusal other
+// than 421 (RFC 5321 section 3.1 names 554 for refusing the session; 421 means
+// the server is closing the channel), but not after an out-of-range or
+// unexpected non-error code or a greeting that failed without a reply.
 func quitAfterGreeting(greetErr error) bool {
 	if greetErr == nil {
 		return true
 	}
 	var smtpErr *SMTPError
-	return errors.As(greetErr, &smtpErr) && smtpErr.Code != 421
+	return errors.As(greetErr, &smtpErr) && canQuitAfterErrorCode(smtpErr.Code)
 }
 
 func parseEnhancedCode(s string) (EnhancedCode, error) {
