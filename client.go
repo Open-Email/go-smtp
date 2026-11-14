@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-sasl"
@@ -28,6 +29,11 @@ type Client struct {
 	text       *textproto.Conn
 	serverName string
 	lmtp       bool
+
+	// Serialize teardown so Abort's deadline enforcer stays active until a
+	// concurrent Close has finished closing the transport.
+	closeMu sync.Mutex
+
 	ext        map[string]string // supported extensions
 	localName  string            // the name to use in HELO/EHLO/LHLO
 	didGreet   bool              // whether we've received greeting from server
@@ -239,7 +245,25 @@ func (c *Client) setConn(conn net.Conn) {
 
 // Close closes the connection.
 func (c *Client) Close() error {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
 	return c.text.Close()
+}
+
+// Abort closes the connection at once: it sends no QUIT, and over TLS it does
+// not wait for the close_notify alert to be written. crypto/tls gives that
+// alert up to 5 seconds, which Close spends in full on a peer that has
+// stopped reading, and during which a command that is waiting for a reply on
+// another goroutine stays blocked. Abort is for enforcing a deadline or a
+// cancellation; Quit ends a session in good order.
+//
+// Unlike the other methods, Abort may be called while another goroutine is
+// inside a command on c. That command then fails with a timeout or a
+// closed-connection error. Abort must not run concurrently with the STARTTLS
+// setup itself (the STARTTLS constructors), which replaces the connection.
+// It is safe to call more than once and after Close or Quit.
+func (c *Client) Abort() error {
+	return c.abortClose()
 }
 
 func (c *Client) greet() error {
@@ -1048,6 +1072,15 @@ func (c *Client) abortClose() error {
 	past := time.Now().Add(-time.Second)
 	conn.SetDeadline(past)
 
+	tc, isTLS := conn.(*tls.Conn)
+	var rawErr error
+	if isTLS {
+		// Closing the underlying transport directly unblocks any in-flight TLS
+		// Read/Write at once and makes any concurrent or subsequent closeNotify
+		// write fail immediately, independent of scheduler timing.
+		rawErr = tc.NetConn().Close()
+	}
+
 	stop := make(chan struct{})
 	stopped := make(chan struct{})
 	timer := time.AfterFunc(time.Millisecond, func() {
@@ -1069,12 +1102,18 @@ func (c *Client) abortClose() error {
 		}
 	})
 
+	// Close waits for any concurrent Client.Close to finish. Keep enforcing
+	// the deadline for that whole wait: a wrapped TLS connection may install
+	// close_notify's future write deadline after an arbitrary scheduler delay.
 	err := c.Close()
 	close(stop)
 	if !timer.Stop() {
 		<-stopped
 	}
 
+	if rawErr != nil && !errors.Is(rawErr, net.ErrClosed) {
+		return rawErr
+	}
 	if err == nil || errors.Is(err, net.ErrClosed) || isTLSCloseNotifyError(err) {
 		return nil
 	}
@@ -1115,7 +1154,12 @@ func (c *Client) Quit() error {
 		return c.abortClose()
 	}
 	_, _, err := c.cmdTimeout(time.Until(deadline), 221, "QUIT")
-	closeErr := c.Close()
+	var closeErr error
+	if quitAfterGreeting(err) {
+		closeErr = c.Close()
+	} else {
+		closeErr = c.abortClose()
+	}
 	if err != nil {
 		return err
 	}
