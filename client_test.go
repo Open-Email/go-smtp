@@ -89,6 +89,9 @@ func TestBasic(t *testing.T) {
 		t.Fatalf("Second EHLO failed: %s", err)
 	}
 
+	// The fake server sends no greeting; mark the session as greeted and
+	// said hello, as helo/ehlo above would have on a real one.
+	c.didGreet = true
 	c.didHello = true
 	if ok, args := c.Extension("aUtH"); !ok || args != "LOGIN PLAIN" {
 		t.Fatalf("Expected AUTH supported")
@@ -449,7 +452,10 @@ func TestHello(t *testing.T) {
 		case 6:
 			err = c.Reset()
 		case 7:
-			err = c.Quit()
+			// Quit sends no hello of its own; say it first.
+			if err = c.hello(); err == nil {
+				err = c.Quit()
+			}
 		case 8:
 			err = c.Verify("test@example.com")
 			if err != nil {
