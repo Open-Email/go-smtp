@@ -223,12 +223,12 @@ func TestAbortRacesConcurrentCloseOverStalledTLS(t *testing.T) {
 		defer pipeSide.Close()
 		// Hold Abort after its expired deadline wakes Mail so the caller's Close
 		// wins crypto/tls's activeCall CAS, then delay closeNotify's 5s
-		// SetWriteDeadline past abortHandoverWait to verify NetConn().Close()
+		// SetWriteDeadline to verify NetConn().Close()
 		// defeats any scheduler delay.
 		clientSide := &ioTrackingConn{
 			Conn:                      pipeSide,
 			afterExpiredDeadline:      func() { time.Sleep(30 * time.Millisecond) },
-			beforeFutureWriteDeadline: func() { time.Sleep(abortHandoverWait + 50*time.Millisecond) },
+			beforeFutureWriteDeadline: func() { time.Sleep(150 * time.Millisecond) },
 		}
 		gotCommand := stalledTLSServer(t, serverSide)
 
@@ -294,6 +294,60 @@ func TestAbortRacesConcurrentCloseOverStalledTLS(t *testing.T) {
 		}
 		wantTransportClosed(t, serverSide)
 	})
+}
+
+// A concurrent Client.Close can win TLS's close interlock and then be
+// descheduled before close_notify installs its five-second write deadline.
+// Abort must keep enforcing its expired deadline until that Close finishes,
+// even when TLS is hidden behind a net.Conn decorator. A fixed 100ms handover
+// stops too early when the winning Close is delayed longer than that.
+func TestAbortWaitsForWrappedTLSCloseWithDelayedDeadline(t *testing.T) {
+	pipeSide, serverSide := net.Pipe()
+	defer pipeSide.Close()
+	closeStarted := make(chan struct{})
+	clientSide := &ioTrackingConn{
+		Conn: pipeSide,
+		beforeFutureWriteDeadline: func() {
+			close(closeStarted)
+			time.Sleep(350 * time.Millisecond)
+		},
+	}
+	gotCommand := stalledTLSServer(t, serverSide)
+
+	tlsConn := tls.Client(clientSide, &tls.Config{InsecureSkipVerify: true})
+	wrapped := &ioTrackingConn{
+		Conn: tlsConn,
+		// Wake Mail, then let its Close win TLS's interlock before Abort
+		// proceeds. The close-notify deadline is still held above.
+		afterExpiredDeadline: func() { <-closeStarted },
+	}
+	c := NewClient(wrapped)
+	c.CommandTimeout = time.Minute
+	if err := c.Hello("sender.example"); err != nil {
+		t.Fatalf("Hello: %v", err)
+	}
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		_ = c.Mail("sender@example.com", nil)
+		_ = c.Close()
+	}()
+	<-gotCommand
+	clientSide.waitParkedInRead(t)
+
+	start := time.Now()
+	if err := c.Abort(); err != nil {
+		t.Errorf("Abort = %v; want nil", err)
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(abortBudget):
+		t.Fatalf("concurrent Close still blocked %v after Abort; deadline enforcement ended before transport closure", time.Since(start))
+	}
+	if elapsed := time.Since(start); elapsed > abortBudget {
+		t.Errorf("Abort and Close took %v; waited for TLS close_notify", elapsed)
+	}
+	wantTransportClosed(t, serverSide)
 }
 
 func TestQuitBrokenReplyOverStalledTLSAbortsCloseNotify(t *testing.T) {

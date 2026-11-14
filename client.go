@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-sasl"
@@ -28,6 +29,11 @@ type Client struct {
 	text       *textproto.Conn
 	serverName string
 	lmtp       bool
+
+	// Serialize teardown so Abort's deadline enforcer stays active until a
+	// concurrent Close has finished closing the transport.
+	closeMu sync.Mutex
+
 	ext        map[string]string // supported extensions
 	localName  string            // the name to use in HELO/EHLO/LHLO
 	didGreet   bool              // whether we've received greeting from server
@@ -239,6 +245,8 @@ func (c *Client) setConn(conn net.Conn) {
 
 // Close closes the connection.
 func (c *Client) Close() error {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
 	return c.text.Close()
 }
 
@@ -1057,13 +1065,6 @@ func enforceDeadline(conn net.Conn, deadline time.Time) func() {
 	}
 }
 
-// abortHandoverWait bounds how long abortClose keeps its expired deadline in
-// place for another goroutine's Close that beat it to the connection. A
-// connection whose SetDeadline reports that it is closed ends the wait
-// earlier, which every net and crypto/tls connection does; the bound is for
-// one that never reports it.
-const abortHandoverWait = 100 * time.Millisecond
-
 // abortClose closes the connection without waiting to flush a TLS close_notify
 // alert onto an already-closing (421) or broken stream.
 func (c *Client) abortClose() error {
@@ -1101,18 +1102,10 @@ func (c *Client) abortClose() error {
 		}
 	})
 
+	// Close waits for any concurrent Client.Close to finish. Keep enforcing
+	// the deadline for that whole wait: a wrapped TLS connection may install
+	// close_notify's future write deadline after an arbitrary scheduler delay.
 	err := c.Close()
-	if !isTLS && errors.Is(err, net.ErrClosed) {
-		// When a *tls.Conn is hidden behind a net.Conn decorator, another
-		// goroutine that got to Close first may still be inside crypto/tls's
-		// Close, which gives close_notify a fresh 5s write deadline over the
-		// expired one set above. Keep the expired deadline in place until the
-		// transport says it is closed, so that write fails at once as well.
-		handover := time.Now().Add(abortHandoverWait)
-		for conn.SetDeadline(past) == nil && time.Now().Before(handover) {
-			time.Sleep(time.Millisecond)
-		}
-	}
 	close(stop)
 	if !timer.Stop() {
 		<-stopped
