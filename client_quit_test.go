@@ -258,7 +258,9 @@ func TestQuitAfterHello421WritesNothing(t *testing.T) {
 			if !errors.As(err, &smtpErr) || smtpErr.Code != 421 {
 				t.Fatalf("Hello = %v; want the 421 reply", err)
 			}
-			c.Quit()
+			if err := c.Quit(); err != nil {
+				t.Errorf("Quit after 421 = %v; want nil", err)
+			}
 			if got := conn.commands(); got != tc.want {
 				t.Errorf("client wrote %q after 421; want %q", got, tc.want)
 			}
@@ -277,7 +279,9 @@ func TestQuitAfterMail421WritesNothing(t *testing.T) {
 	if !errors.As(err, &smtpErr) || smtpErr.Code != 421 {
 		t.Fatalf("Mail = %v; want the 421 reply", err)
 	}
-	c.Quit()
+	if err := c.Quit(); err != nil {
+		t.Errorf("Quit after 421 = %v; want nil", err)
+	}
 	if got, want := conn.commands(), "EHLO localhost\nMAIL FROM:<sender@example.com>\n"; got != want {
 		t.Errorf("client wrote %q after 421; want %q", got, want)
 	}
@@ -401,7 +405,9 @@ func TestQuitAfterClosingGreeting(t *testing.T) {
 			if err := c.Hello("r5.out.example"); err == nil {
 				t.Fatal("Hello succeeded without a 220 greeting")
 			}
-			c.Quit()
+			if err := c.Quit(); err != nil {
+				t.Errorf("Quit after failed greeting = %v; want nil", err)
+			}
 			if got := conn.commands(); got != "" {
 				t.Errorf("client wrote %q after the greeting failed; want nothing", got)
 			}
@@ -410,6 +416,150 @@ func TestQuitAfterClosingGreeting(t *testing.T) {
 			}
 		})
 	}
+
+	// Real transports return net.ErrClosed when greet already closed the
+	// connection and Quit closes it again.
+	clientSide, serverSide := net.Pipe()
+	defer clientSide.Close()
+	go func() {
+		serverSide.Write([]byte("421 shutting down\r\n"))
+		serverSide.Close()
+	}()
+	c := NewClient(clientSide)
+	if err := c.Hello("r5.out.example"); err == nil {
+		t.Fatal("Hello succeeded after 421 greeting")
+	}
+	if err := c.Quit(); err != nil {
+		t.Errorf("Quit on real pipe after 421 greeting = %v; want nil", err)
+	}
+}
+
+func TestQuitAfterBrokenStreamWritesNothing(t *testing.T) {
+	t.Run("command timeout", func(t *testing.T) {
+		clientSide, serverSide := net.Pipe()
+		defer clientSide.Close()
+		defer serverSide.Close()
+		var commands []string
+		serverDone := make(chan struct{})
+		go func() {
+			defer close(serverDone)
+			r := bufio.NewReader(serverSide)
+			serverSide.Write([]byte("220 hello\r\n"))
+			if line, err := r.ReadString('\n'); err == nil {
+				commands = append(commands, line)
+				serverSide.Write([]byte("250 hello\r\n"))
+			}
+			// Read MAIL FROM and never answer it; read until client closes.
+			for {
+				line, err := r.ReadString('\n')
+				if line != "" {
+					commands = append(commands, line)
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		c := NewClient(clientSide)
+		c.CommandTimeout = 40 * time.Millisecond
+		c.QuitTimeout = 500 * time.Millisecond
+		if err := c.Hello("sender.example"); err != nil {
+			t.Fatalf("Hello: %v", err)
+		}
+		if err := c.Mail("sender@example.com", nil); err == nil {
+			t.Fatal("Mail succeeded without a reply")
+		}
+		start := time.Now()
+		if err := c.Quit(); err != nil {
+			t.Errorf("Quit after command timeout = %v; want nil", err)
+		}
+		if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+			t.Errorf("Quit waited %v after command timeout; want immediate close", elapsed)
+		}
+		<-serverDone
+		if got, want := strings.Join(commands, ""), "EHLO sender.example\r\nMAIL FROM:<sender@example.com>\r\n"; got != want {
+			t.Errorf("client wrote %q; want %q without QUIT", got, want)
+		}
+	})
+
+	t.Run("protocol error", func(t *testing.T) {
+		conn := newScriptedConn("220 hello\nnot an smtp reply\n221 bye\n")
+		c := NewClient(conn)
+		if err := c.Hello("sender.example"); err == nil {
+			t.Fatal("Hello succeeded on malformed reply")
+		}
+		if err := c.Quit(); err != nil {
+			t.Errorf("Quit after protocol error = %v; want nil", err)
+		}
+		if got, want := conn.commands(), "EHLO sender.example\n"; got != want {
+			t.Errorf("client wrote %q; want %q", got, want)
+		}
+		if !conn.closed {
+			t.Error("Quit left the connection open")
+		}
+	})
+
+	t.Run("unclosed DATA", func(t *testing.T) {
+		conn := newScriptedConn("220 hello\n250 hello\n250 sender ok\n250 rcpt ok\n354 go ahead\n")
+		c := NewClient(conn)
+		if err := c.Hello("sender.example"); err != nil {
+			t.Fatalf("Hello: %v", err)
+		}
+		if err := c.Mail("sender@example.com", nil); err != nil {
+			t.Fatalf("Mail: %v", err)
+		}
+		if err := c.Rcpt("rcpt@example.com", nil); err != nil {
+			t.Fatalf("Rcpt: %v", err)
+		}
+		if _, err := c.Data(); err != nil {
+			t.Fatalf("Data: %v", err)
+		}
+		if err := c.Quit(); err != nil {
+			t.Errorf("Quit during open DATA = %v; want nil", err)
+		}
+		want := "EHLO sender.example\nMAIL FROM:<sender@example.com>\nRCPT TO:<rcpt@example.com>\nDATA\n"
+		if got := conn.commands(); got != want {
+			t.Errorf("client wrote %q during open DATA; want %q", got, want)
+		}
+		if !conn.closed {
+			t.Error("Quit left the connection open")
+		}
+	})
+
+	t.Run("closed DATA refused with 554 still sends QUIT", func(t *testing.T) {
+		conn := newScriptedConn("220 hello\n250 hello\n250 sender ok\n250 rcpt ok\n354 go ahead\n554 message rejected\n221 bye\n")
+		c := NewClient(conn)
+		if err := c.Hello("sender.example"); err != nil {
+			t.Fatalf("Hello: %v", err)
+		}
+		if err := c.Mail("sender@example.com", nil); err != nil {
+			t.Fatalf("Mail: %v", err)
+		}
+		if err := c.Rcpt("rcpt@example.com", nil); err != nil {
+			t.Fatalf("Rcpt: %v", err)
+		}
+		w, err := c.Data()
+		if err != nil {
+			t.Fatalf("Data: %v", err)
+		}
+		if _, err := io.WriteString(w, "Subject: test\r\n\r\nhi\r\n"); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		if err := w.Close(); err == nil {
+			t.Fatal("w.Close succeeded despite 554")
+		}
+		if err := c.Quit(); err != nil {
+			t.Errorf("Quit after 554 DATA reply = %v; want nil", err)
+		}
+		want := "EHLO sender.example\nMAIL FROM:<sender@example.com>\nRCPT TO:<rcpt@example.com>\nDATA\nSubject: test\n\nhi\n.\nQUIT\n"
+		if got := conn.commands(); got != want {
+			t.Errorf("client wrote %q; want %q", got, want)
+		}
+		if !conn.closed {
+			t.Error("Quit left the connection open")
+		}
+	})
 }
 
 func TestStartTLSSetupFailureEndsWithQuit(t *testing.T) {
@@ -427,6 +577,14 @@ func TestStartTLSSetupFailureEndsWithQuit(t *testing.T) {
 		"STARTTLS answered with 421": {
 			server: "220 hello\n" + "250-mx at your service\n" + "250 STARTTLS\n" + "421 closing\n",
 			want:   "EHLO r5.out.example\nSTARTTLS\n",
+		},
+		"EHLO refused": {
+			server: "220 hello\n" + "550 access denied\n" + "221 bye\n",
+			want:   "EHLO r5.out.example\nQUIT\n",
+		},
+		"EHLO answered with 421": {
+			server: "220 hello\n" + "421 closing\n",
+			want:   "EHLO r5.out.example\n",
 		},
 		"554 greeting": {
 			server: "554 5.7.1 your IP is listed\n" + "221 bye\n",
@@ -449,5 +607,60 @@ func TestStartTLSSetupFailureEndsWithQuit(t *testing.T) {
 	}
 	if _, err := NewClientStartTLSWithName(newScriptedConn("220 hello\n250 mx\n221 bye\n"), nil, "h"); !errors.Is(err, ErrSTARTTLSUnsupported) {
 		t.Errorf("error for a server without STARTTLS = %v, want ErrSTARTTLSUnsupported", err)
+	}
+}
+
+func TestStartTLSSetupFailureBoundsIgnoredQuit(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer clientSide.Close()
+	defer serverSide.Close()
+	quitSeen := make(chan struct{})
+	serverDone := make(chan error, 1)
+	go func() {
+		r := bufio.NewReader(serverSide)
+		if _, err := io.WriteString(serverSide, "220 hello\r\n"); err != nil {
+			serverDone <- err
+			return
+		}
+		if line, err := r.ReadString('\n'); err != nil || line != "EHLO r5.out.example\r\n" {
+			serverDone <- err
+			return
+		}
+		if _, err := io.WriteString(serverSide, "250 mx at your service\r\n"); err != nil {
+			serverDone <- err
+			return
+		}
+		line, err := r.ReadString('\n')
+		if err != nil || line != "QUIT\r\n" {
+			serverDone <- errors.New("expected cleanup QUIT")
+			return
+		}
+		close(quitSeen)
+		// Ignore QUIT until the constructor's bounded cleanup closes the pipe.
+		_, err = io.Copy(io.Discard, r)
+		serverDone <- err
+	}()
+
+	start := time.Now()
+	c, err := NewClientStartTLSWithName(clientSide, nil, "r5.out.example")
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrSTARTTLSUnsupported) || c != nil {
+		t.Fatalf("NewClientStartTLSWithName = %v, %v; want nil, ErrSTARTTLSUnsupported", c, err)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("NewClientStartTLSWithName waited %v on ignored cleanup QUIT; want bounded well below 10s QuitTimeout", elapsed)
+	}
+	select {
+	case <-quitSeen:
+	default:
+		t.Fatal("server never received cleanup QUIT")
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server script: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("NewClientStartTLSWithName returned without closing the transport")
 	}
 }

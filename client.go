@@ -36,14 +36,15 @@ type Client struct {
 	helloError error             // the error from the hello
 	rcpts      []string          // recipients accumulated for the current session
 
-	serverClosing bool // whether the server has sent a 421 reply
+	cannotQuit bool // 421 reply, broken wire/protocol state, or unclosed DATA stream
 
 	// Time to wait for command responses (this includes 3xx reply to DATA).
 	CommandTimeout time.Duration
 	// Time to wait for responses after final dot.
 	SubmissionTimeout time.Duration
 	// Time allowed for Quit, including an unread greeting, the QUIT reply,
-	// and connection cleanup. Zero means CommandTimeout.
+	// and connection cleanup. NewClient sets this to 10s; zero or negative
+	// means CommandTimeout.
 	QuitTimeout time.Duration
 
 	// Logger for all network activity.
@@ -153,13 +154,23 @@ func NewClientStartTLSWithName(conn net.Conn, tlsConfig *tls.Config, localName s
 // server's EHLO reply does not offer STARTTLS.
 var ErrSTARTTLSUnsupported = errors.New("smtp: server doesn't support STARTTLS")
 
+// setupQuitTimeout bounds the cleanup QUIT sent when DialStartTLS or
+// NewClientStartTLS* fails after receiving an SMTP reply. The connection is
+// already established and at a command boundary, so a responsive peer answers
+// within one round trip; a peer that ignores QUIT must not stall setup failure
+// or plaintext fallback for the full 10s QuitTimeout.
+const setupQuitTimeout = time.Second
+
 // endAfterSetupError ends the session after a failed STARTTLS setup. While
-// the server is still listening (STARTTLS not offered, or EHLO or STARTTLS
-// refused with a reply other than 421) it says QUIT, so the server does not
-// log a dropped connection; otherwise it closes the connection.
+// the server is still listening (STARTTLS not offered, or greeting, EHLO, or
+// STARTTLS refused with a reply other than 421) it says QUIT, so the server
+// does not log a dropped connection; otherwise it closes the connection.
 func (c *Client) endAfterSetupError(err error) {
 	var smtpErr *SMTPError
 	if errors.Is(err, ErrSTARTTLSUnsupported) || (errors.As(err, &smtpErr) && smtpErr.Code != 421) {
+		if c.QuitTimeout <= 0 || c.QuitTimeout > setupQuitTimeout {
+			c.QuitTimeout = setupQuitTimeout
+		}
 		c.Quit()
 		return
 	}
@@ -237,9 +248,9 @@ func (c *Client) greetTimeout(timeout time.Duration) error {
 	_, _, err := c.readResponse(220)
 	if err != nil {
 		c.greetError = err
-		// A server refusing the session with a 554 greeting stays connected
-		// waiting for QUIT (RFC 5321 section 3.1), so leave the connection
-		// to the caller's Quit or Close. Anything else ends it here.
+		// A server refusing the session with a greeting other than 421 (RFC 5321
+		// section 3.1 names 554) stays connected waiting for QUIT, so leave the
+		// connection to the caller's Quit or Close. Anything else ends it here.
 		if !quitAfterGreeting(err) {
 			c.text.Close()
 		}
@@ -306,10 +317,12 @@ func (c *Client) SetLocalName(localName string) error {
 func (c *Client) readResponse(expectCode int) (int, string, error) {
 	code, msg, err := c.text.ReadResponse(expectCode)
 	if code == 421 {
-		c.serverClosing = true
+		c.cannotQuit = true
 	}
 	if protoErr, ok := err.(*textproto.Error); ok {
 		err = toSMTPErr(protoErr)
+	} else if err != nil {
+		c.cannotQuit = true
 	}
 	return code, msg, err
 }
@@ -327,6 +340,7 @@ func (c *Client) cmdTimeout(timeout time.Duration, expectCode int, format string
 
 	id, err := c.text.Cmd(format, args...)
 	if err != nil {
+		c.cannotQuit = true
 		return 0, "", err
 	}
 	c.text.StartResponse(id)
@@ -666,6 +680,7 @@ func (cmd *DataCommand) CloseWithResponse() (*DataResponse, error) {
 	if err := cmd.close(); err != nil {
 		return nil, err
 	}
+	cmd.client.cannotQuit = false
 
 	cmd.client.conn.SetDeadline(time.Now().Add(cmd.client.SubmissionTimeout))
 	defer cmd.client.conn.SetDeadline(time.Time{})
@@ -691,6 +706,7 @@ func (cmd *DataCommand) CloseWithLMTPResponse() (map[string]*DataResponse, error
 	if err := cmd.close(); err != nil {
 		return nil, err
 	}
+	cmd.client.cannotQuit = false
 
 	cmd.client.conn.SetDeadline(time.Now().Add(cmd.client.SubmissionTimeout))
 	defer cmd.client.conn.SetDeadline(time.Time{})
@@ -772,6 +788,7 @@ func (c *Client) Data() (*DataCommand, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.cannotQuit = true
 	return &DataCommand{client: c, wc: c.text.DotWriter()}, nil
 }
 
@@ -963,8 +980,9 @@ func (c *Client) Noop() error {
 // session (RFC 5321 section 4.1.1.10). After a greeting that refused the
 // session with 554, QUIT is still sent, as RFC 5321 section 3.1 asks.
 // If the greeting has not been read, Quit reads it within the same timeout.
-// After a 421 reply to any command, or a greeting that failed without a
-// complete SMTP reply, the connection is closed without sending QUIT.
+// After a 421 reply to any command, a broken or timed-out command, an unclosed
+// DATA stream, or a greeting that failed without a complete SMTP reply, the
+// connection is closed without sending QUIT.
 func (c *Client) Quit() error {
 	timeout := c.QuitTimeout
 	if timeout <= 0 {
@@ -1003,11 +1021,18 @@ func (c *Client) Quit() error {
 		}
 	}()
 
+	alreadyGreeted := c.didGreet
 	if err := c.greetTimeout(time.Until(deadline)); !quitAfterGreeting(err) {
-		c.Close()
-		return err
+		closeErr := c.Close()
+		if !alreadyGreeted {
+			return err
+		}
+		if errors.Is(closeErr, net.ErrClosed) {
+			return nil
+		}
+		return closeErr
 	}
-	if c.serverClosing {
+	if c.cannotQuit {
 		return c.Close()
 	}
 	_, _, err := c.cmdTimeout(time.Until(deadline), 221, "QUIT")
