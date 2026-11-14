@@ -36,7 +36,8 @@ type Client struct {
 	helloError error             // the error from the hello
 	rcpts      []string          // recipients accumulated for the current session
 
-	cannotQuit bool // 421 reply, broken wire/protocol state, or unclosed DATA stream
+	cannotQuit bool // 421 reply or broken wire/protocol state; never cleared
+	dataOpen   bool // DATA stream not closed yet, so QUIT would land in the message
 
 	// Time to wait for command responses (this includes 3xx reply to DATA).
 	CommandTimeout time.Duration
@@ -503,12 +504,14 @@ func (c *Client) Auth(a sasl.Client) error {
 			}
 		}
 		if err != nil {
-			if !c.cannotQuit {
+			if unclean {
+				// A reply that is neither a challenge, a success, nor a
+				// 4xx/5xx refusal leaves no exchange to cancel: the session
+				// is desynchronized, so write nothing more onto it.
+				c.cannotQuit = true
+			} else if !c.cannotQuit {
 				// abort the AUTH
 				c.cmd(501, "*")
-			}
-			if unclean {
-				c.cannotQuit = true
 			}
 			break
 		}
@@ -704,7 +707,7 @@ func (cmd *DataCommand) CloseWithResponse() (*DataResponse, error) {
 	if err := cmd.close(); err != nil {
 		return nil, err
 	}
-	cmd.client.cannotQuit = false
+	cmd.client.dataOpen = false
 
 	cmd.client.conn.SetDeadline(time.Now().Add(cmd.client.SubmissionTimeout))
 	defer cmd.client.conn.SetDeadline(time.Time{})
@@ -730,7 +733,7 @@ func (cmd *DataCommand) CloseWithLMTPResponse() (map[string]*DataResponse, error
 	if err := cmd.close(); err != nil {
 		return nil, err
 	}
-	cmd.client.cannotQuit = false
+	cmd.client.dataOpen = false
 
 	cmd.client.conn.SetDeadline(time.Now().Add(cmd.client.SubmissionTimeout))
 	defer cmd.client.conn.SetDeadline(time.Time{})
@@ -812,7 +815,7 @@ func (c *Client) Data() (*DataCommand, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.cannotQuit = true
+	c.dataOpen = true
 	return &DataCommand{client: c, wc: c.text.DotWriter()}, nil
 }
 
@@ -1108,7 +1111,7 @@ func (c *Client) Quit() error {
 		}
 		return closeErr
 	}
-	if c.cannotQuit {
+	if c.cannotQuit || c.dataOpen {
 		return c.abortClose()
 	}
 	_, _, err := c.cmdTimeout(time.Until(deadline), 221, "QUIT")

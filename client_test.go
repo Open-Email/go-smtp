@@ -39,7 +39,8 @@ func TestClientAuthTrimSpace(t *testing.T) {
 	c.didHello = true
 	c.Auth(toServerNoRespAuth{})
 	c.Close()
-	if got, want := wrote.String(), "AUTH FOOAUTH\r\n*\r\n"; got != want {
+	// The scripted 200 is not an AUTH reply, so no SASL cancel line follows.
+	if got, want := wrote.String(), "AUTH FOOAUTH\r\n"; got != want {
 		t.Errorf("wrote %q; want %q", got, want)
 	}
 }
