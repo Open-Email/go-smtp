@@ -242,6 +242,22 @@ func (c *Client) Close() error {
 	return c.text.Close()
 }
 
+// Abort closes the connection at once: it sends no QUIT, and over TLS it does
+// not wait for the close_notify alert to be written. crypto/tls gives that
+// alert up to 5 seconds, which Close spends in full on a peer that has
+// stopped reading, and during which a command that is waiting for a reply on
+// another goroutine stays blocked. Abort is for enforcing a deadline or a
+// cancellation; Quit ends a session in good order.
+//
+// Unlike the other methods, Abort may be called while another goroutine is
+// inside a command on c. That command then fails with a timeout or a
+// closed-connection error. Abort must not run concurrently with the STARTTLS
+// setup itself (the STARTTLS constructors), which replaces the connection.
+// It is safe to call more than once and after Close or Quit.
+func (c *Client) Abort() error {
+	return c.abortClose()
+}
+
 func (c *Client) greet() error {
 	return c.greetTimeout(c.CommandTimeout)
 }
@@ -1041,6 +1057,13 @@ func enforceDeadline(conn net.Conn, deadline time.Time) func() {
 	}
 }
 
+// abortHandoverWait bounds how long abortClose keeps its expired deadline in
+// place for another goroutine's Close that beat it to the connection. A
+// connection whose SetDeadline reports that it is closed ends the wait
+// earlier, which every net and crypto/tls connection does; the bound is for
+// one that never reports it.
+const abortHandoverWait = 100 * time.Millisecond
+
 // abortClose closes the connection without waiting to flush a TLS close_notify
 // alert onto an already-closing (421) or broken stream.
 func (c *Client) abortClose() error {
@@ -1070,6 +1093,18 @@ func (c *Client) abortClose() error {
 	})
 
 	err := c.Close()
+	if errors.Is(err, net.ErrClosed) {
+		// Another goroutine got to close the connection first (Abort during a
+		// command whose caller then closes, or during Quit, which ends with a
+		// Close). It may still be inside crypto/tls's Close, which gives
+		// close_notify a fresh 5s write deadline over the expired one set
+		// above. Keep the expired deadline in place until the transport says
+		// it is closed, so that write fails at once as well.
+		handover := time.Now().Add(abortHandoverWait)
+		for conn.SetDeadline(past) == nil && time.Now().Before(handover) {
+			time.Sleep(time.Millisecond)
+		}
+	}
 	close(stop)
 	if !timer.Stop() {
 		<-stopped
