@@ -166,10 +166,17 @@ func NewClientStartTLSWithName(conn net.Conn, tlsConfig *tls.Config, localName s
 // started means the server accepted the STARTTLS command and the client now
 // speaks TLS on the connection. The TLS handshake itself, and with it any
 // certificate verification under tlsConfig, has not run yet: it runs on the
-// next I/O, the EHLO that the next command sends first, and its errors
-// surface from that command. A caller that wants the handshake settled
-// before it commits to the session can send that EHLO with Hello, or with
-// any command, and check TLSConnectionState().HandshakeComplete after it.
+// next I/O over the connection, and its error surfaces from the call that
+// did it. A caller that wants the handshake settled before it commits to the
+// session calls Hello(localName) and handles its error; if it needs the
+// details, HandshakeComplete is in the state TLSConnectionState returns:
+//
+//	if err := c.Hello(localName); err != nil {
+//		// the handshake or the EHLO after it failed
+//	}
+//	if state, ok := c.TLSConnectionState(); ok && state.HandshakeComplete {
+//		// negotiated: state.Version, state.CipherSuite, ...
+//	}
 //
 // Any failure is the one NewClientStartTLSWithName would report, and the
 // session is ended the same way. It never returns ErrSTARTTLSUnsupported.
