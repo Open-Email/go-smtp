@@ -156,6 +156,40 @@ func NewClientStartTLSWithName(conn net.Conn, tlsConfig *tls.Config, localName s
 	return c, nil
 }
 
+// NewClientStartTLSIfOfferedWithName is NewClientStartTLSWithName for a
+// caller that sends without TLS to a server that has none. When the server's
+// EHLO reply does not offer STARTTLS, or the server only knows HELO, it
+// returns the client as it stands after the hello, on the same connection,
+// and reports started as false: the session goes on in plaintext, and it is
+// the caller's to end. Otherwise it starts TLS and reports started as true.
+//
+// Any failure is the one NewClientStartTLSWithName would report, and the
+// session is ended the same way. It never returns ErrSTARTTLSUnsupported.
+//
+// NewClientStartTLSWithName says QUIT when STARTTLS is not offered, so a
+// caller that then delivers in plaintext needs a second connection: the
+// server sees a session that greets and quits without mail, followed at once
+// by another from the same address.
+func NewClientStartTLSIfOfferedWithName(conn net.Conn, tlsConfig *tls.Config, localName string) (c *Client, started bool, err error) {
+	c = NewClient(conn)
+	if err := c.SetLocalName(localName); err != nil {
+		c.Close()
+		return nil, false, err
+	}
+	if err := c.hello(); err != nil {
+		c.endAfterSetupError(err)
+		return nil, false, err
+	}
+	if ok, _ := c.Extension("STARTTLS"); !ok {
+		return c, false, nil
+	}
+	if err := c.startTLS(tlsConfig); err != nil {
+		c.endAfterSetupError(err)
+		return nil, false, err
+	}
+	return c, true, nil
+}
+
 // ErrSTARTTLSUnsupported is returned by the STARTTLS constructors when the
 // server's EHLO reply does not offer STARTTLS.
 var ErrSTARTTLSUnsupported = errors.New("smtp: server doesn't support STARTTLS")
