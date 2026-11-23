@@ -156,6 +156,55 @@ func NewClientStartTLSWithName(conn net.Conn, tlsConfig *tls.Config, localName s
 	return c, nil
 }
 
+// NewClientStartTLSIfOfferedWithName is NewClientStartTLSWithName for a
+// caller that sends without TLS to a server that has none. When the server's
+// EHLO reply does not offer STARTTLS, or the server only knows HELO, it
+// returns the client as it stands after the hello, on the same connection,
+// and reports started as false: the session goes on in plaintext, and it is
+// the caller's to end. Otherwise it starts TLS and reports started as true.
+//
+// started means the server accepted the STARTTLS command and the client now
+// speaks TLS on the connection. The TLS handshake itself, and with it any
+// certificate verification under tlsConfig, has not run yet: it runs on the
+// next I/O over the connection, and its error surfaces from the call that
+// did it. A caller that wants the handshake settled before it commits to the
+// session calls Hello(localName) and handles its error; if it needs the
+// details, HandshakeComplete is in the state TLSConnectionState returns:
+//
+//	if err := c.Hello(localName); err != nil {
+//		// the handshake or the EHLO after it failed
+//	}
+//	if state, ok := c.TLSConnectionState(); ok && state.HandshakeComplete {
+//		// negotiated: state.Version, state.CipherSuite, ...
+//	}
+//
+// Any failure is the one NewClientStartTLSWithName would report, and the
+// session is ended the same way. It never returns ErrSTARTTLSUnsupported.
+//
+// NewClientStartTLSWithName says QUIT when STARTTLS is not offered, so a
+// caller that then delivers in plaintext needs a second connection: the
+// server sees a session that greets and quits without mail, followed at once
+// by another from the same address.
+func NewClientStartTLSIfOfferedWithName(conn net.Conn, tlsConfig *tls.Config, localName string) (c *Client, started bool, err error) {
+	c = NewClient(conn)
+	if err := c.SetLocalName(localName); err != nil {
+		c.Close()
+		return nil, false, err
+	}
+	if err := c.hello(); err != nil {
+		c.endAfterSetupError(err)
+		return nil, false, err
+	}
+	if ok, _ := c.Extension("STARTTLS"); !ok {
+		return c, false, nil
+	}
+	if err := c.startTLS(tlsConfig); err != nil {
+		c.endAfterSetupError(err)
+		return nil, false, err
+	}
+	return c, true, nil
+}
+
 // ErrSTARTTLSUnsupported is returned by the STARTTLS constructors when the
 // server's EHLO reply does not offer STARTTLS.
 var ErrSTARTTLSUnsupported = errors.New("smtp: server doesn't support STARTTLS")
@@ -411,16 +460,21 @@ func (c *Client) ehlo() error {
 	if err != nil {
 		return err
 	}
+	// EHLO keywords are case-insensitive (RFC 5321 §2.4, §4.1.1.1), and
+	// every lookup below and in Extension is in upper case: fold the keyword
+	// here, or an extension advertised as "starttls" or "8bitmime" is taken
+	// to be absent. The parameter keeps the server's spelling.
 	ext := make(map[string]string)
 	extList := strings.Split(msg, "\n")
 	if len(extList) > 1 {
 		extList = extList[1:]
 		for _, line := range extList {
 			args := strings.SplitN(line, " ", 2)
+			keyword := strings.ToUpper(args[0])
 			if len(args) > 1 {
-				ext[args[0]] = args[1]
+				ext[keyword] = args[1]
 			} else {
-				ext[args[0]] = ""
+				ext[keyword] = ""
 			}
 		}
 	}
