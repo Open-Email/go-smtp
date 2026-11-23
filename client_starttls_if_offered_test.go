@@ -133,3 +133,23 @@ func TestStartTLSIfOfferedRefusesABadLocalName(t *testing.T) {
 		t.Errorf("client wrote %q before refusing the name", got)
 	}
 }
+
+// started promises the STARTTLS command was accepted, not that TLS works: the
+// handshake runs on the next I/O, and its error comes from that command.
+func TestStartTLSIfOfferedHandshakeRunsOnTheNextCommand(t *testing.T) {
+	// After "220 go ahead" the server sends plaintext, not a TLS ServerHello.
+	conn := newScriptedConn("220 hello\n" + "250-mx at your service\n" + "250 STARTTLS\n" + "220 go ahead\n" + "250 not TLS\n")
+	c, started, err := NewClientStartTLSIfOfferedWithName(conn, nil, "r5.out.example")
+	if err != nil || c == nil || !started {
+		t.Fatalf("NewClientStartTLSIfOfferedWithName = %v, %v, %v; want a started client", c, started, err)
+	}
+	if state, ok := c.TLSConnectionState(); !ok || state.HandshakeComplete {
+		t.Fatalf("TLSConnectionState = %+v, %v; want a TLS connection whose handshake has not run", state, ok)
+	}
+	if err := c.Hello("r5.out.example"); err == nil {
+		t.Fatal("Hello succeeded over a connection whose TLS handshake cannot complete")
+	}
+	if state, _ := c.TLSConnectionState(); state.HandshakeComplete {
+		t.Error("handshake reported complete after it failed")
+	}
+}

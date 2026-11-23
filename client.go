@@ -163,6 +163,14 @@ func NewClientStartTLSWithName(conn net.Conn, tlsConfig *tls.Config, localName s
 // and reports started as false: the session goes on in plaintext, and it is
 // the caller's to end. Otherwise it starts TLS and reports started as true.
 //
+// started means the server accepted the STARTTLS command and the client now
+// speaks TLS on the connection. The TLS handshake itself, and with it any
+// certificate verification under tlsConfig, has not run yet: it runs on the
+// next I/O, the EHLO that the next command sends first, and its errors
+// surface from that command. A caller that wants the handshake settled
+// before it commits to the session can send that EHLO with Hello, or with
+// any command, and check TLSConnectionState().HandshakeComplete after it.
+//
 // Any failure is the one NewClientStartTLSWithName would report, and the
 // session is ended the same way. It never returns ErrSTARTTLSUnsupported.
 //
@@ -445,16 +453,21 @@ func (c *Client) ehlo() error {
 	if err != nil {
 		return err
 	}
+	// EHLO keywords are case-insensitive (RFC 5321 §2.4, §4.1.1.1), and
+	// every lookup below and in Extension is in upper case: fold the keyword
+	// here, or an extension advertised as "starttls" or "8bitmime" is taken
+	// to be absent. The parameter keeps the server's spelling.
 	ext := make(map[string]string)
 	extList := strings.Split(msg, "\n")
 	if len(extList) > 1 {
 		extList = extList[1:]
 		for _, line := range extList {
 			args := strings.SplitN(line, " ", 2)
+			keyword := strings.ToUpper(args[0])
 			if len(args) > 1 {
-				ext[args[0]] = args[1]
+				ext[keyword] = args[1]
 			} else {
-				ext[args[0]] = ""
+				ext[keyword] = ""
 			}
 		}
 	}
