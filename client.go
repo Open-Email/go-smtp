@@ -42,8 +42,8 @@ type Client struct {
 	helloError error             // the error from the hello
 	rcpts      []string          // recipients accumulated for the current session
 
-	cannotQuit bool // 421 reply or broken wire/protocol state; never cleared
-	dataOpen   bool // DATA stream not closed yet, so QUIT would land in the message
+	quitMode quitMode // once QUIT is unsafe, it stays unsafe
+	dataOpen bool     // DATA stream not closed yet, so QUIT would land in the message
 
 	// Time to wait for command responses (this includes 3xx reply to DATA).
 	CommandTimeout time.Duration
@@ -57,6 +57,14 @@ type Client struct {
 	// Logger for all network activity.
 	DebugWriter io.Writer
 }
+
+type quitMode uint8
+
+const (
+	quitSendCommand quitMode = iota
+	quitSendAlert            // SMTP is ending but the TLS write side may still work
+	quitAbort                // the wire or protocol state is broken
+)
 
 // 30 seconds was chosen as it's the same duration as http.DefaultTransport's
 // timeout.
@@ -325,7 +333,8 @@ func (c *Client) greetTimeout(timeout time.Duration) error {
 	}
 
 	// Initial greeting timeout. RFC 5321 recommends 5 minutes.
-	c.conn.SetDeadline(time.Now().Add(timeout))
+	deadline := time.Now().Add(timeout)
+	c.conn.SetDeadline(deadline)
 	defer c.conn.SetDeadline(time.Time{})
 
 	c.didGreet = true
@@ -336,7 +345,7 @@ func (c *Client) greetTimeout(timeout time.Duration) error {
 		// section 3.1 names 554) stays connected waiting for QUIT, so leave the
 		// connection to the caller's Quit or Close. Anything else ends it here.
 		if !quitAfterGreeting(err) {
-			c.abortClose()
+			c.closeWithoutQuit(deadline)
 		}
 	}
 
@@ -400,22 +409,36 @@ func (c *Client) SetLocalName(localName string) error {
 
 func (c *Client) readResponse(expectCode int) (int, string, error) {
 	code, msg, err := c.text.ReadResponse(expectCode)
-	if code == 221 || code == 421 || code < 200 || code >= 600 {
-		c.cannotQuit = true
-	}
-	if protoErr, ok := err.(*textproto.Error); ok {
+	protoErr, _ := err.(*textproto.Error)
+	switch {
+	case code == 421 || (err != nil && protoErr == nil && isResponseTimeout(err)):
+		// A complete 421 or a read timeout can leave TLS able to write an
+		// alert. A previous hard failure still rules out a graceful close.
+		if c.quitMode == quitSendCommand {
+			c.quitMode = quitSendAlert
+		}
+	case code == 221 || code < 200 || code >= 600:
+		c.quitMode = quitAbort
+	case protoErr != nil:
 		// Standard 4xx/5xx refusals (except 421) and 25x completion replies to
 		// commands expecting 250 (such as VRFY returning 251/252) leave the
 		// session synchronized at a command boundary; out-of-range or
 		// unexpected 2xx/3xx replies do not.
 		if !canQuitAfterErrorCode(protoErr.Code) && !(expectCode == 250 && protoErr.Code/10 == 25) {
-			c.cannotQuit = true
+			c.quitMode = quitAbort
 		}
+	case err != nil:
+		c.quitMode = quitAbort
+	}
+	if protoErr != nil {
 		err = toSMTPErr(protoErr)
-	} else if err != nil {
-		c.cannotQuit = true
 	}
 	return code, msg, err
+}
+
+func isResponseTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // cmd is a convenience function that sends a command and returns the response
@@ -431,7 +454,7 @@ func (c *Client) cmdTimeout(timeout time.Duration, expectCode int, format string
 
 	id, err := c.text.Cmd(format, args...)
 	if err != nil {
-		c.cannotQuit = true
+		c.quitMode = quitAbort
 		return 0, "", err
 	}
 	c.text.StartResponse(id)
@@ -571,7 +594,7 @@ func (c *Client) Auth(a sasl.Client) error {
 			// the last message isn't base64 because it isn't a challenge
 			msg = []byte(msg64)
 		default:
-			unclean = !canQuitAfterErrorCode(code)
+			unclean = code != 421 && !canQuitAfterErrorCode(code)
 			err = toSMTPErr(&textproto.Error{Code: code, Msg: msg64})
 		}
 		if err == nil {
@@ -586,8 +609,8 @@ func (c *Client) Auth(a sasl.Client) error {
 				// A reply that is neither a challenge, a success, nor a
 				// 4xx/5xx refusal leaves no exchange to cancel: the session
 				// is desynchronized, so write nothing more onto it.
-				c.cannotQuit = true
-			} else if !c.cannotQuit {
+				c.quitMode = quitAbort
+			} else if c.quitMode == quitSendCommand {
 				// abort the AUTH
 				c.cmd(501, "*")
 			}
@@ -1120,7 +1143,7 @@ func enforceDeadline(conn net.Conn, deadline time.Time) func() {
 }
 
 // abortClose closes the connection without waiting to flush a TLS close_notify
-// alert onto an already-closing (421) or broken stream.
+// alert. It also interrupts in-flight commands when called by Abort.
 func (c *Client) abortClose() error {
 	conn := c.conn
 	past := time.Now().Add(-time.Second)
@@ -1180,6 +1203,43 @@ func isTLSCloseNotifyError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "tls: failed to send closeNotify alert (but connection was closed anyway)")
 }
 
+// closeWithoutQuit gives a writable TLS connection a short opportunity to
+// send close_notify when SMTP has already stopped accepting commands.
+func (c *Client) closeWithoutQuit(deadline time.Time) error {
+	if c.quitMode != quitSendAlert || c.dataOpen || !time.Now().Before(deadline) {
+		return c.abortClose()
+	}
+	if alertDeadline := time.Now().Add(200 * time.Millisecond); alertDeadline.Before(deadline) {
+		deadline = alertDeadline
+	}
+	stop := enforceDeadline(c.conn, deadline)
+	defer stop()
+	err := c.Close()
+	if errors.Is(err, net.ErrClosed) || isTLSCloseNotifyError(err) {
+		return nil
+	}
+	return err
+}
+
+// closeAfterQuit exchanges TLS shutdown alerts after a successful QUIT.
+func (c *Client) closeAfterQuit(deadline time.Time) error {
+	if tc, ok := c.conn.(*tls.Conn); ok && tc.CloseWrite() == nil {
+		// Some peers wait for transport EOF before closing their own side.
+		if transport, ok := tc.NetConn().(interface{ CloseWrite() error }); ok {
+			_ = transport.CloseWrite()
+		}
+		if drainDeadline := time.Now().Add(time.Second); drainDeadline.Before(deadline) {
+			deadline = drainDeadline
+		}
+		if tc.SetReadDeadline(deadline) == nil {
+			// A peer that does not finish TLS shutdown has still accepted QUIT.
+			_, _ = io.Copy(io.Discard, tc)
+		}
+	}
+	// tls.Conn.Close also returns an error from sending our close_notify.
+	return c.Close()
+}
+
 // Quit sends the QUIT command and closes the connection to the server.
 //
 // The connection is always closed, also when QUIT is refused or its reply
@@ -1191,6 +1251,9 @@ func isTLSCloseNotifyError(err error) bool {
 // After a 421 reply, an out-of-range or desynchronized reply, a broken or
 // timed-out command, an unclosed DATA stream, or a greeting that failed
 // without a 4xx/5xx refusal, the connection is closed without sending QUIT.
+// On a *tls.Conn, a successful QUIT allows up to one second within QuitTimeout
+// for the peer's TLS shutdown alert. After a 421 or a response timeout, Quit
+// makes a short best-effort attempt to send a TLS alert if the stream is writable.
 func (c *Client) Quit() error {
 	deadline := time.Now().Add(c.quitTimeout())
 	stopDeadline := enforceDeadline(c.conn, deadline)
@@ -1198,26 +1261,25 @@ func (c *Client) Quit() error {
 
 	alreadyGreeted := c.didGreet
 	if err := c.greetTimeout(time.Until(deadline)); !quitAfterGreeting(err) {
-		closeErr := c.abortClose()
 		if !alreadyGreeted {
+			// greetTimeout has already closed the connection.
 			return err
 		}
-		return closeErr
+		return c.closeWithoutQuit(deadline)
 	}
-	if c.cannotQuit || c.dataOpen {
-		return c.abortClose()
+	if c.quitMode != quitSendCommand || c.dataOpen {
+		return c.closeWithoutQuit(deadline)
 	}
 	_, _, err := c.cmdTimeout(time.Until(deadline), 221, "QUIT")
-	var closeErr error
+	if err == nil {
+		return c.closeAfterQuit(deadline)
+	}
 	if quitAfterGreeting(err) {
-		closeErr = c.Close()
+		_ = c.Close()
 	} else {
-		closeErr = c.abortClose()
+		_ = c.closeWithoutQuit(deadline)
 	}
-	if err != nil {
-		return err
-	}
-	return closeErr
+	return err
 }
 
 // quitAfterGreeting reports whether QUIT may be sent after a greeting that
